@@ -165,6 +165,7 @@ class NoiseWrapper(Wrapper):
     """
 
     noise_scale: jax.Array | None = field(default=None)
+    noise_multiplier: float = field(default=1.0)
 
     def __post_init__(self) -> None:
         noise_scale = self.noise_scale
@@ -177,7 +178,7 @@ class NoiseWrapper(Wrapper):
                     name: value for name, value in defaults.items() if name in sensors
                 }
             ).to_noise_scale(layout)
-        noise_scale = jnp.asarray(noise_scale)
+        noise_scale = jnp.asarray(noise_scale) * self.noise_multiplier
         if noise_scale.shape != self.env.observation_space.shape:
             raise ValueError(
                 "noise_scale shape must match observation space: "
@@ -829,6 +830,7 @@ def RealisticWrappers(
     max_steps: int | None = None,
     time_aware: bool = False,
     quantize_bins: int | None = None,
+    noise_multiplier: float = 1.0,
 ) -> Environment:
     """Compose configured physics, sensor, and action effects for training."""
     cfg = env.plasmax_config
@@ -840,7 +842,7 @@ def RealisticWrappers(
             env = PhysicsRandomizationWrapper(env)
         real = cfg.observations.realistic
         if real.noise:
-            env = NoiseWrapper(env)
+            env = NoiseWrapper(env, noise_multiplier=noise_multiplier)
         if real.resolution:
             env = ObsFilterWrapper.from_resolution_config(env)
         if real.filter is not None:

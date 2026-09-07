@@ -99,6 +99,9 @@ class EnvConfig:
     force_minimal_callback: bool = False
     # Append the environment time coordinate as an extra observation scalar.
     time_aware: bool = False
+    # Scales all wrappers.yaml noise magnitudes (0 = no noise). Relative
+    # proportions between sensors are preserved.
+    noise_multiplier: float = 1.0
     # Discretize every actuator into this many evenly spaced bins (MultiDiscrete
     # action space; realistic variant only). None = continuous actions.
     quantize_bins: int | None = None
@@ -276,7 +279,8 @@ def _load_env(cfg: Config, backend_alias_or_path: str | None):
             raise ValueError("quantize_bins is a realistic action degradation")
         return OracleWrappers(env, time_aware=cfg.env.time_aware)
     return RealisticWrappers(
-        env, time_aware=cfg.env.time_aware, quantize_bins=cfg.env.quantize_bins
+        env, time_aware=cfg.env.time_aware, quantize_bins=cfg.env.quantize_bins,
+        noise_multiplier=cfg.env.noise_multiplier,
     )
 
 
