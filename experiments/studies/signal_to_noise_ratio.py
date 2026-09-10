@@ -95,6 +95,14 @@ def main(
     obs_flat = obs_traces.reshape(-1, obs_traces.shape[-1])
     valid_flat = valid_traces.reshape(-1)
 
+    # Assess episode length
+    completion_rate = float(jnp.mean(valid_traces[:, -1]))
+    mean_valid_steps = float(jnp.sum(valid_flat)) / n_episodes
+    print(
+        f"completion_rate={completion_rate:.3f}  "
+        f"mean_valid_steps={mean_valid_steps:.1f}"
+    )
+
     header = (
         f"{'sensor':<18}{'rel_std':>8}{'obs_mean':>12}"
         f"{'natural_std':>14}{'noise@1.0x':>12}{'ratio':>10}"
