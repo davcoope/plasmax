@@ -6,6 +6,13 @@ wrappers.yaml noise magnitude (at multiplier=1.0) against that sensor's
 natural std across episodes. Prints a per-sensor table including the 
 noise/signal  ratio (noise std / observation std). 
 
+Actions are held at zero each step by default. --random generates a 
+random action within the actuator bounds for every step instead.
+Zero and random actions bracket the true natural variation from opposite
+sides - zero likely understates it (actuator-driven signals barely move 
+on their own) and random likely overstates it (a trained policy explores a 
+much narrower range than the full action space).
+
 PhysicsRandomizationWrapper is included but not other wrappers - no 
 need since no policy is being trained.
 """
@@ -32,20 +39,33 @@ sensors = layout.profile_names + layout.scalar_names
 noise_cfg = env.plasmax_config.observations.realistic.noise
 
 
-@partial(jax.jit, static_argnames=("n_steps",))
-def rollout(key, n_steps):
+@partial(jax.jit, static_argnames=("n_steps", "random"))
+def rollout(key, n_steps, random):
+    key, action_key = jax.random.split(key)
     state, info = env.init(key)
-    action = jnp.zeros(env.action_space.shape, dtype=env.action_space.dtype)
+    zero_action = jnp.zeros(env.action_space.shape, dtype=env.action_space.dtype)
 
     def body(carry, _):
-        state, _ = carry
+        state, _, action_key = carry
+        # random is a static arg, so this branches at trace time -
+        # only one path is ever actually compiled.
+        if random:
+            action_key, sample_key = jax.random.split(action_key)
+            action = jax.random.uniform(
+                sample_key,
+                env.action_space.shape,
+                minval=env.action_space.low,
+                maxval=env.action_space.high,
+                dtype=env.action_space.dtype,
+            )
+        else:
+            action = zero_action
         state, info = env.step(state, action)
         done = info.terminated | info.truncated
-        return (state, info), (info.obs, done)
+        return (state, info, action_key), (info.obs, done)
 
-    # obs_trace: (n_steps, 24) - one row per timestep.
-    _, (obs_trace, done_trace) = jax.lax.scan(
-        body, (state, info), None, n_steps
+    (_, _, _), (obs_trace, done_trace) = jax.lax.scan(
+        body, (state, info, action_key), None, n_steps
     )
     # Prepend the pre-step observation so the trace includes the start.
     obs_trace = jnp.concatenate([info.obs[None], obs_trace], axis=0)
@@ -59,14 +79,19 @@ def rollout(key, n_steps):
     valid = ~done_so_far
     return obs_trace, valid
 
-# Multiple independent episodes to improve estimate of natural_std.
-n_episodes = 64
+
 # iter/hybrid/flattop episode length: 440s / 0.1s per step.
 n_steps = 4400
 
-def main(n_episodes: int = 64) -> None:
+def main(
+        n_episodes: int = 64,
+        random: bool = False
+        )-> None:
+    # Multiple independent episodes to improve estimate of natural_std.
     keys = jax.random.split(jax.random.key(0), n_episodes)
-    obs_traces, valid_traces = jax.vmap(rollout, in_axes=(0, None))(keys, n_steps)
+    obs_traces, valid_traces = jax.vmap(
+        partial(rollout, n_steps=n_steps, random=random)
+    )(keys)
     obs_flat = obs_traces.reshape(-1, obs_traces.shape[-1])
     valid_flat = valid_traces.reshape(-1)
 
