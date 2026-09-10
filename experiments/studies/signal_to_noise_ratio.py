@@ -13,8 +13,13 @@ import jax.numpy as jnp
 from functools import partial
 
 from plasmax.environment.factory import make
+from plasmax.wrappers import PhysicsRandomizationWrapper
 
 env = make("iter/hybrid/flattop", backend="bohm_gyrobohm")
+# Add physics randomisation wrapper.
+# No need for other wrappers as no policy is being trained.
+if env.plasmax_config.physics_randomization:
+    env = PhysicsRandomizationWrapper(env)
 layout = env.obs_layout()
 # All observation names.
 sensors = layout.profile_names + layout.scalar_names
