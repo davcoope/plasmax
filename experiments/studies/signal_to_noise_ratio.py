@@ -30,21 +30,33 @@ def rollout(key, n_steps):
     def body(carry, _):
         state, _ = carry
         state, info = env.step(state, action)
-        return (state, info), info.obs
+        done = info.terminated | info.truncated
+        return (state, info), (info.obs, done)
 
     # obs_trace: (n_steps, 24) - one row per timestep.
-    _, obs_trace = jax.lax.scan(body, (state, info), None, n_steps)
+    _, (obs_trace, done_trace) = jax.lax.scan(
+        body, (state, info), None, n_steps
+    )
     # Prepend the pre-step observation so the trace includes the start.
-    return jnp.concatenate([info.obs[None], obs_trace], axis=0)
-
+    obs_trace = jnp.concatenate([info.obs[None], obs_trace], axis=0)
+    done_trace = jnp.concatenate([jnp.array([False]), done_trace], axis=0)
+    # True from the step after the episode first ends onward, so a
+    # disrupted/truncated episode's post-episode steps (which keep
+    # running under scan with no auto-reset) can be excluded below.
+    done_so_far = jnp.concatenate(
+        [jnp.array([False]), jnp.cumsum(done_trace)[:-1] > 0]
+    )
+    valid = ~done_so_far
+    return obs_trace, valid
 
 # Multiple independent episodes to improve estimate of natural_std.
-n_episodes = 8
+n_episodes = 64
 # iter/hybrid/flattop episode length: 440s / 0.1s per step.
 n_steps = 4400
 keys = jax.random.split(jax.random.key(0), n_episodes)
-obs_traces = jax.vmap(rollout, in_axes=(0, None))(keys, n_steps)
+obs_traces, valid_traces = jax.vmap(rollout, in_axes=(0, None))(keys, n_steps)
 obs_flat = obs_traces.reshape(-1, obs_traces.shape[-1])
+valid_flat = valid_traces.reshape(-1)
 
 header = (
     f"{'sensor':<18}{'rel_std':>8}{'obs_mean':>12}"
@@ -57,10 +69,12 @@ for name in sensors:
     vals = obs_flat[:, sl]
     # Relative noise std for this sensor, from wrappers.yaml.
     rel_std = noise_cfg.get(name, 0.0)
-    obs_mean = float(jnp.mean(jnp.abs(vals)))
+    # Steps after an episode ends are set to NaN and ignored below.
+    masked = jnp.where(valid_flat[:, None], vals, jnp.nan)
+    obs_mean = float(jnp.nanmean(jnp.abs(masked)))
     # Natural spread across episodes — not noise from this script,
     # since no NoiseWrapper is applied here.
-    natural_std = float(jnp.std(vals))
+    natural_std = float(jnp.nanstd(masked))    
     # Noise std the wrapper would add at multiplier 1.0 (hypothetical
     # — reconstructed here, not actually applied).
     noise_1x = rel_std * obs_mean
