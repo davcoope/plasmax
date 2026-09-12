@@ -1,31 +1,26 @@
-"""Observation signal statistics collected during real PPO training.
+"""Observation statistics collected during real PPO training.
 
-Trains iter/hybrid/flattop exactly as ``train_ppo.py`` does, but inserts an
-``ObsStatsWrapper`` into the environment stack that accumulates per-sensor
-running mean/variance (Welford) over every observation the agent actually
-receives. The point is to measure each sensor's *natural* variation under a
-genuinely learning policy, rather than under the zero-action or
-random-action proxies used by ``experiments/studies/signal_to_noise_ratio``.
+Trains iter/hybrid/flattop like ``train_ppo.py``, with an ``ObsStatsWrapper``
+that tracks running per-sensor mean/variance (Welford) of every observation
+the agent receives - measuring natural variation under a real, learning
+policy, unlike the zero/random-action proxies in
+``experiments/studies/signal_to_noise_ratio``.
 
-Training and evaluation statistics are kept separate without any explicit
-flag: ``rejax``'s evaluator builds fresh env states via ``env.reset`` and
-discards them, so accumulations made during evaluation never merge back
-into the training state. Eval statistics are therefore computed separately,
-from the eval rollout's own observations, inside the eval callback.
+Buckets one per eval checkpoint (ceil(total_timesteps / eval_freq)), so
+train bucket i and eval checkpoint i cover the same training window.
+Training and eval stay separate automatically: rejax's evaluator builds
+and discards its own env states via ``env.reset``, never touching the
+training accumulator.
 
-Three sets of numbers are produced. The number of buckets is not fixed -
-it equals the number of eval checkpoints, ceil(total_timesteps / eval_freq),
-so train bucket i and eval checkpoint i cover the same span of training:
+Statistics use the *degraded* observation space (what the policy actually
+sees), not the full-resolution space NoiseWrapper operates on. Run with
+``--env.noise-multiplier 0.0`` to measure natural variation uncontaminated
+by injected noise.
 
-* ``total``    - one mean/std per sensor over all training observations.
-* ``train[i]`` - disjoint buckets, each the training window before eval i.
-* ``eval[i]``  - one per eval checkpoint, eval rollouts only.
-
-Statistics are taken in the *degraded* observation space (what the policy
-actually sees: downsampled profiles, filtered channels, delay applied), not
-the full-resolution space the noise wrapper operates on. Run with
-``--env.noise-multiplier 0.0`` so that the measured variation is the
-plasma's own, uncontaminated by injected observation noise.
+Logs through the same ``SeedBufferLogger`` as ``train_ppo.py``, so progress
+and ``evaluation/*``/``train/*`` metrics look identical, with per-sensor
+tables printed live at each checkpoint (seed-averaged) and a final TOTAL
+table over the whole run.
 
 Run:
     uv run python training/obs_stats_training.py \\
@@ -39,15 +34,18 @@ from __future__ import annotations
 import dataclasses
 import math
 import operator
+import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import tyro
-import wandb
 from envelope import WrappedState, Wrapper, field, static_field
 
-from experiments.plotting.wandb_logging import _collect_returns_and_lengths
+from experiments.plotting.wandb_logging import (
+    _base_metrics,
+    _collect_returns_and_lengths,
+)
 from experiments.studies.baseline_study import seed_keys
 from plasmax.environment.factory import make
 from plasmax.wrappers import (
@@ -60,8 +58,8 @@ from plasmax.wrappers import (
     TruncationWrapper,
     _training_wrappers,
 )
-from scripts.project_paths import wandb_dir
 from training.train_ppo import Config, _build_algo, _run_name
+from training.vmap_logging import SeedBufferLogger
 
 # ---------------------------------------------------------------------------
 # Statistics wrapper
@@ -135,9 +133,14 @@ class ObsStatsWrapper(Wrapper):
 
     def step(self, state: ObsStatsState, action):
         inner_state, info = self.env.step(state.inner_state, action)
+        # A solver-failure disruption (core.py's termination_code=3) can
+        # return a non-finite obs; core.py guards reward against this same
+        # case (`reward = jnp.where(disruption, ...)`), but not obs itself.
+        # A finite disruption boundary (q_min/Greenwald) is real, policy-
+        # relevant data and stays in; only non-finite steps are skipped.
+        valid = jnp.all(jnp.isfinite(info.obs))
         bucket = jnp.minimum(state.step // self.bucket_size, self.n_buckets - 1)
 
-        # Welford update, applied only to the active bucket's row.
         count_b = state.count[bucket] + 1.0
         delta = info.obs - state.mean[bucket]
         mean_b = state.mean[bucket] + delta / count_b
@@ -145,9 +148,13 @@ class ObsStatsWrapper(Wrapper):
 
         next_state = ObsStatsState(
             inner_state=inner_state,
-            count=state.count.at[bucket].set(count_b),
-            mean=state.mean.at[bucket].set(mean_b),
-            m2=state.m2.at[bucket].set(m2_b),
+            count=state.count.at[bucket].set(
+                jnp.where(valid, count_b, state.count[bucket])
+            ),
+            mean=state.mean.at[bucket].set(
+                jnp.where(valid, mean_b, state.mean[bucket])
+            ),
+            m2=state.m2.at[bucket].set(jnp.where(valid, m2_b, state.m2[bucket])),
             step=state.step + 1,
         )
         return next_state, info
@@ -190,6 +197,40 @@ def _merge(count, mean, m2, axis):
 def _std(count, m2):
     safe = np.where(count == 0.0, 1.0, count)
     return np.sqrt(np.maximum(m2 / safe, 0.0))
+
+
+def _merge_jax(count, mean, m2, axis):
+    """In-trace equivalent of :func:`_merge`, for use inside the callback."""
+    total = jnp.sum(count, axis=axis)
+    safe = jnp.where(total == 0.0, 1.0, total)
+    merged_mean = jnp.sum(count * mean, axis=axis) / safe
+    spread = (mean - jnp.expand_dims(merged_mean, axis)) ** 2
+    merged_m2 = jnp.sum(m2 + count * spread, axis=axis)
+    return total, merged_mean, merged_m2
+
+
+def _obs_metrics(prefix, layout, names, noise_cfg, count, mean, m2):
+    """Flat ``{metric_name: scalar}`` dict for one bucket's statistics.
+
+    ``count``/``mean``/``m2`` are per-observation-channel arrays of shape
+    ``(obs_dim,)``. Channels belonging to one sensor are merged so each
+    sensor contributes a single mean/std, matching the end-of-run tables.
+    """
+    metrics = {}
+    for name in names:
+        sl = layout.slice_of(name)
+        total, _, sensor_m2 = _merge_jax(count[sl], mean[sl], m2[sl], axis=0)
+        safe = jnp.where(total == 0.0, 1.0, total)
+        obs_std = jnp.sqrt(jnp.maximum(sensor_m2 / safe, 0.0))
+        abs_mean = jnp.mean(jnp.abs(mean[sl]))
+        noise_std = float(noise_cfg.get(name, 0.0)) * abs_mean
+        metrics[f"{prefix}/{name}/obs_abs_mean"] = abs_mean
+        metrics[f"{prefix}/{name}/obs_std"] = obs_std
+        metrics[f"{prefix}/{name}/noise_std_at_1x"] = noise_std
+        metrics[f"{prefix}/{name}/noise_to_signal"] = jnp.where(
+            obs_std > 0.0, noise_std / jnp.where(obs_std > 0.0, obs_std, 1.0), jnp.nan
+        )
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -260,33 +301,94 @@ def _sensor_slices(env):
 # ---------------------------------------------------------------------------
 
 
-def _make_eval_callback(num_steps: int, n_seeds: int, eval_rng, deterministic: bool):
-    """Return (returns, lengths, eval obs stats) per eval checkpoint.
+def _make_logging_callback(
+    logger,
+    *,
+    layout,
+    names,
+    noise_cfg,
+    bucket_size,
+    n_buckets,
+    num_steps,
+    n_seeds,
+    eval_rng,
+    deterministic,
+):
+    """``run_idx -> callback`` factory, mirroring make_buffered_seed_callback.
 
-    Deliberately does no host-side logging: under ``vmap`` over seeds that
-    needs buffering machinery, and everything here is logged once at the end
-    from the stacked return values instead.
+    Emits exactly the metrics a normal ``train_ppo.py`` run emits, plus the
+    observation statistics for the training bucket that just finished
+    (``obs_train/*``, read out of ``ts.env_state``) and for this checkpoint's
+    own eval rollouts (``obs_eval/*``, computed from the eval trajectory).
+    Routing through ``logger.log`` via ``jax.debug.callback`` means it
+    appears live during training rather than only at the end. The tables
+    themselves are printed by :class:`_TableLogger` at flush time, so they
+    are seed-averaged and stay ordered with the ``step=`` progress line.
     """
 
-    def _callback(algo, ts, rng, train_metrics=None):
-        del train_metrics
-        traj, returns, lengths = _collect_returns_and_lengths(
-            algo,
-            ts,
-            eval_rng if eval_rng is not None else rng,
-            num_steps,
-            n_seeds,
-            lean=True,
-            deterministic=deterministic,
-        )
-        # traj.obs: (n_seeds, num_steps, obs_dim); traj.valid: (n_seeds, num_steps).
-        valid = traj.valid[..., None]
-        count = jnp.maximum(jnp.sum(traj.valid).astype(jnp.float32), 1.0)
-        mean = jnp.sum(jnp.where(valid, traj.obs, 0.0), axis=(0, 1)) / count
-        m2 = jnp.sum(jnp.where(valid, (traj.obs - mean) ** 2, 0.0), axis=(0, 1))
-        return returns, lengths, (count, mean, m2)
+    def for_run(run_idx):
+        def _callback(algo, ts, rng, train_metrics):
+            traj, episode_returns, episode_lengths = _collect_returns_and_lengths(
+                algo,
+                ts,
+                eval_rng if eval_rng is not None else rng,
+                num_steps,
+                n_seeds,
+                lean=True,
+                deterministic=deterministic,
+            )
+            metrics = _base_metrics(
+                traj, episode_returns, episode_lengths, train_metrics
+            )
 
-    return _callback
+            # --- training bucket that just completed -------------------
+            stats = _find_stats_state(ts.env_state)
+            # (num_envs, n_buckets[, obs_dim]) -> merge over envs.
+            count = stats.count[..., None] * jnp.ones_like(stats.mean)
+            train_count, train_mean, train_m2 = _merge_jax(
+                count, stats.mean, stats.m2, axis=0
+            )
+            # Buckets fill in order, so the one just closed is step//size - 1.
+            # Clipped for the pre-training checkpoint, where none are filled
+            # yet and the reported counts are simply zero.
+            idx = jnp.clip(stats.step[0] // bucket_size - 1, 0, n_buckets - 1)
+            metrics.update(
+                _obs_metrics(
+                    "obs_train",
+                    layout,
+                    names,
+                    noise_cfg,
+                    train_count[idx],
+                    train_mean[idx],
+                    train_m2[idx],
+                )
+            )
+
+            # --- this checkpoint's eval rollouts -----------------------
+            valid = traj.valid[..., None]
+            eval_count = jnp.maximum(jnp.sum(traj.valid).astype(jnp.float32), 1.0)
+            eval_mean = jnp.sum(jnp.where(valid, traj.obs, 0.0), axis=(0, 1)) / eval_count
+            eval_m2 = jnp.sum(
+                jnp.where(valid, (traj.obs - eval_mean) ** 2, 0.0), axis=(0, 1)
+            )
+            eval_count_vec = jnp.full_like(eval_mean, eval_count)
+            metrics.update(
+                _obs_metrics(
+                    "obs_eval",
+                    layout,
+                    names,
+                    noise_cfg,
+                    eval_count_vec,
+                    eval_mean,
+                    eval_m2,
+                )
+            )
+            jax.debug.callback(logger.log, ts.global_step, run_idx, metrics)
+            return episode_returns, episode_lengths
+
+        return _callback
+
+    return for_run
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +445,65 @@ def _print_table(title: str, rows) -> None:
         )
 
 
+class _TableLogger(SeedBufferLogger):
+    """SeedBufferLogger that also prints per-sensor tables at flush time.
+
+    The observation statistics already travel in the metrics dict, so the
+    tables are rebuilt from the seed-averaged values rather than printed
+    per-seed. Printing here (rather than from a separate debug callback)
+    keeps each table adjacent to its own ``step=`` progress line instead of
+    racing it - ``jax.debug.callback`` ordering across a vmapped seed axis
+    is not guaranteed.
+    """
+
+    def __init__(self, *args, layout, names, noise_cfg, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._layout = layout
+        self._names = names
+        self._noise_cfg = noise_cfg
+
+    def _rows_from_metrics(self, prefix, mean):
+        rows = []
+        for name in self._names:
+            key = f"{prefix}/{name}"
+            if f"{key}/obs_std" not in mean:
+                return None
+            rows.append(
+                {
+                    "sensor": name,
+                    "noise_rel_std": float(self._noise_cfg.get(name, 0.0)),
+                    "obs_abs_mean": mean[f"{key}/obs_abs_mean"],
+                    "obs_std": mean[f"{key}/obs_std"],
+                    "noise_std_at_1x": mean[f"{key}/noise_std_at_1x"],
+                    "noise_to_signal": mean[f"{key}/noise_to_signal"],
+                }
+            )
+        return rows
+
+    def _flush_step(self, step: int) -> None:
+        # Read the buffer before super() pops it, so the tables print above
+        # the step= line that super() emits.
+        per_seed = self._buffers.get(step, {})
+        if per_seed:
+            keys = list(next(iter(per_seed.values())).keys())
+            mean = {
+                k: float(np.mean([per_seed[r][k] for r in sorted(per_seed)]))
+                for k in keys
+            }
+            elapsed = time.time() - (self.start_time or time.time())
+            # At step 0 no training bucket has closed, so only eval is real.
+            if step > 0:
+                rows = self._rows_from_metrics("obs_train", mean)
+                if rows:
+                    _print_table(f"TRAIN bucket @ step {step:,}", rows)
+            rows = self._rows_from_metrics("obs_eval", mean)
+            if rows:
+                label = "pre-training" if step == 0 else f"step {step:,}"
+                _print_table(f"EVAL checkpoint @ {label} (t+{elapsed:.0f}s)", rows)
+            print()
+        super()._flush_step(step)
+
+
 def main(cfg: Config) -> None:
     if cfg.env.noise_multiplier != 0.0:
         print(
@@ -359,93 +520,91 @@ def main(cfg: Config) -> None:
     layout, names = _sensor_slices(env)
     noise_cfg = env.plasmax_config.observations.realistic.noise
 
+    run_name = f"{_run_name(cfg)}-obsstats"
+    logger = _TableLogger(
+        num_seeds=cfg.num_seeds,
+        run_name=run_name,
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        group=cfg.wandb.group,
+        mode=cfg.wandb.mode,
+        config=dataclasses.asdict(cfg),
+        out_dir=cfg.history_dir,
+        seed_ids=tuple(range(cfg.seed, cfg.seed + cfg.num_seeds)),
+        job_type=cfg.algorithm,
+        tags=cfg.wandb.tags,
+        layout=layout,
+        names=names,
+        noise_cfg=noise_cfg,
+    )
+
     # Reuse train_ppo's builder so agent_kwargs/env_params/normalisation
     # options stay in sync with the launcher rather than drifting.
     algo = _build_algo(cfg, env)
-    algo = algo.with_eval_callback(
-        _make_eval_callback(
-            num_steps=algo.env_params.max_steps_in_episode,
-            n_seeds=cfg.env.eval_n_envs,
-            eval_rng=jax.random.PRNGKey(cfg.env.eval_seed),
-            deterministic=cfg.env.deterministic_eval,
-        )
+    for_run = _make_logging_callback(
+        logger,
+        layout=layout,
+        names=names,
+        noise_cfg=noise_cfg,
+        bucket_size=bucket_size,
+        n_buckets=n_buckets,
+        num_steps=algo.env_params.max_steps_in_episode,
+        n_seeds=cfg.env.eval_n_envs,
+        eval_rng=jax.random.PRNGKey(cfg.env.eval_seed),
+        deterministic=cfg.env.deterministic_eval,
     )
 
-    run = wandb.init(
-        entity=cfg.wandb.entity,
-        project=cfg.wandb.project,
-        group=cfg.wandb.group,
-        tags=cfg.wandb.tags,
-        mode=cfg.wandb.mode,
-        name=f"{_run_name(cfg)}-obsstats",
-        config=dataclasses.asdict(cfg),
-        dir=str(wandb_dir()),
-    )
+    # rejax evaluates once before training, but from outside its lax.scan -
+    # with no data dependency on the scan, XLA is free to schedule that
+    # callback after later ones, so it lands out of order in the log. Run it
+    # explicitly here instead, and tell rejax to skip its own.
+    algo = algo.replace(skip_initial_evaluation=True)
+
+    def pre_eval(rng, run_idx):
+        algo_i = algo.with_eval_callback(for_run(run_idx))
+        ts0 = algo_i.init_state(rng)
+        return algo_i.eval_callback(algo_i, ts0, ts0.rng)
+
+    def train_one(rng, run_idx):
+        # Rebuilt inside the trace so each vmapped seed's run_idx tracer
+        # reaches logger.log, exactly as train_ppo's _run_vmap does.
+        return algo.with_eval_callback(for_run(run_idx)).train(rng)
 
     seeds = seed_keys(cfg.seed, cfg.num_seeds)
-    train_fn = jax.jit(jax.vmap(algo.train))
-    print(f"Training {cfg.num_seeds} seeds, bucket_size={bucket_size} steps/env ...")
-    ts, evaluation = train_fn(seeds)
-    jax.effects_barrier()
+    run_idxs = jnp.arange(cfg.num_seeds)
+    train_fn = jax.jit(jax.vmap(train_one))
 
-    # --- Training statistics: read the accumulators out of the final state ---
+    print(f"Lowering ({cfg.num_seeds} seeds), bucket_size={bucket_size} steps/env ...")
+    lowered = train_fn.lower(seeds, run_idxs)
+    print("Compiling ...")
+    lowered.compile()
+
+    logger.start_time = time.time()
+    jax.block_until_ready(jax.jit(jax.vmap(pre_eval))(seeds, run_idxs))
+    ts, _ = train_fn(seeds, run_idxs)
+    jax.block_until_ready(ts)
+
+    # --- End-of-run summary tables from the final accumulators ---
     stats = _find_stats_state(ts.env_state)
-    # (n_seeds, num_envs, n_buckets, obs_dim) -> merge over seeds and envs.
     count = np.asarray(stats.count)[..., None] * np.ones_like(np.asarray(stats.mean))
     mean = np.asarray(stats.mean)
     m2 = np.asarray(stats.m2)
-    flat = (count.reshape(-1, n_buckets, count.shape[-1]),
-            mean.reshape(-1, n_buckets, mean.shape[-1]),
-            m2.reshape(-1, n_buckets, m2.shape[-1]))
+    flat = (
+        count.reshape(-1, n_buckets, count.shape[-1]),
+        mean.reshape(-1, n_buckets, mean.shape[-1]),
+        m2.reshape(-1, n_buckets, m2.shape[-1]),
+    )
     train_count, train_mean, train_m2 = _merge(*flat, axis=0)
     total_count, total_mean, total_m2 = _merge(
         train_count, train_mean, train_m2, axis=0
     )
 
-    # --- Eval statistics: stacked over checkpoints by rejax's scan ---
-    # rejax prepends one extra, pre-training evaluation at index 0
-    # (skip_initial_evaluation defaults False) - kept, but reported
-    # separately below since it has no corresponding train bucket.
-    eval_count, eval_mean, eval_m2 = (np.asarray(x) for x in evaluation[2])
-    # (n_seeds, n_buckets + 1, ...) -> merge over seeds only.
-    eval_count = eval_count[..., None] * np.ones_like(eval_mean)
-    eval_count, eval_mean, eval_m2 = _merge(eval_count, eval_mean, eval_m2, axis=0)
-
     total_rows = _sensor_rows(
         layout, names, noise_cfg, total_count, total_mean, total_m2
     )
-    _print_table("TOTAL (all training observations)", total_rows)
+    _print_table("TOTAL - all training observations, all seeds", total_rows)
 
-    for i in range(n_buckets):
-        rows = _sensor_rows(
-            layout, names, noise_cfg, train_count[i], train_mean[i], train_m2[i]
-        )
-        _print_table(f"TRAIN bucket {i + 1}/{n_buckets}", rows)
-        for row in rows:
-            wandb.log(
-                {f"obs_train/{row['sensor']}/{k}": v for k, v in row.items() if k != "sensor"},
-                step=int((i + 1) * cfg.ppo.eval_freq),
-            )
-
-    n_checkpoints = eval_mean.shape[0]
-    for i in range(n_checkpoints):
-        rows = _sensor_rows(
-            layout, names, noise_cfg, eval_count[i], eval_mean[i], eval_m2[i]
-        )
-        _print_table(f"EVAL checkpoint {i + 1}/{n_checkpoints}", rows)
-        for row in rows:
-            wandb.log(
-                {f"obs_eval/{row['sensor']}/{k}": v for k, v in row.items() if k != "sensor"},
-                step=int((i + 1) * cfg.ppo.eval_freq),
-            )
-
-    table = wandb.Table(columns=[name for name, _, _ in _HEADERS])
-    for row in total_rows:
-        table.add_data(*[row[name] for name, _, _ in _HEADERS])
-    wandb.log({"obs_total/table": table})
-
-    print(f"\nreturns (final checkpoint): {np.asarray(evaluation[0])[:, -1].mean():.3f}")
-    run.finish()
+    logger.finish()
 
 
 if __name__ == "__main__":
