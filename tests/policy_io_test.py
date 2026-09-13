@@ -17,10 +17,11 @@ from agents.mpc import MPCAgent
 from agents.policy_io import load_policy, save_policy
 from agents.ppo import PPOAdapter, ResidualGaussianPolicy
 from agents.sac import SACAdapter
-from plasmax import rewards
+from plasmax import make, rewards
 from plasmax.spaces import ObsLayout
-from plasmax.wrappers import ObsHistoryWrapper, QuantizeActionWrapper
+from plasmax.wrappers import ObsHistoryWrapper, QuantizeActionWrapper, RealisticWrappers
 from training.envelope_gymnax import EnvelopeGymnax
+from training.runs import load_policy_env
 
 
 class ScalarDiscreteEnv(CheapBoundaryEnv):
@@ -262,6 +263,90 @@ def test_backprop_roundtrip_preserves_parameters_and_source_clock(tmp_path, kind
         np.testing.assert_allclose(
             act(obs.at[clock].set(5), jax.random.key(0)),
             jnp.tanh(state.params[-1]),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize("kind", ["ppo", "sac", "policy", "knots_10", "knots_100"])
+def test_kstar_policy_roundtrip_preserves_native_interface_and_clock(tmp_path, kind):
+    open_loop = kind.startswith("knots_")
+    env = RealisticWrappers(make("kstar_worldmodel"), time_aware=open_loop)
+    if kind in {"ppo", "sac"}:
+        gymnax_env = EnvelopeGymnax(env)
+        common = dict(
+            env=gymnax_env,
+            env_params=gymnax_env.default_params,
+            num_envs=1,
+            total_timesteps=100,
+            eval_freq=100,
+            normalize_observations=False,
+        )
+        if kind == "ppo":
+            agent = PPOAdapter.create(
+                **common,
+                num_steps=2,
+                num_minibatches=1,
+                agent_kwargs={"hidden_layer_sizes": (4,)},
+            )
+        else:
+            agent = SACAdapter.create(
+                **common, buffer_size=4, batch_size=1, hidden_layer_sizes=(4,)
+            )
+    else:
+        common = dict(total_timesteps=100, num_rollouts=1, gradient_horizon=4)
+        if open_loop:
+            agent = BackpropOpenLoopAgent.create(
+                env, num_knots=int(kind.removeprefix("knots_")), **common
+            )
+        else:
+            agent = BackpropPolicyAgent.create(env, hidden_sizes=(4,), **common)
+    state = agent.init_state(jax.random.PRNGKey(0))
+    if open_loop:
+        state = state.replace(
+            params=jnp.broadcast_to(
+                jnp.linspace(-1.0, 1.0, agent.num_knots)[:, None],
+                (agent.num_knots, 6),
+            )
+        )
+    path = save_policy(
+        agent,
+        state,
+        tmp_path / f"{kind}.msgpack",
+        deterministic=True,
+        metadata={
+            "config": {
+                "env": {
+                    "env_setup": "kstar_worldmodel",
+                    "backend": None,
+                    "variant": "realistic",
+                }
+            }
+        },
+    )
+
+    loaded = load_policy(path)
+    restored_env = load_policy_env(loaded)
+    env_state, info = restored_env.init(jax.random.key(1))
+    restored_act = loaded.make_act()
+    expected_act = agent.make_act(state, deterministic=True)
+    np.testing.assert_allclose(
+        restored_act(info.obs, jax.random.key(2)),
+        expected_act(info.obs, jax.random.key(2)),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert loaded.metadata["source_config"]["task"]["reward"] == "native"
+    assert loaded.metadata["source_max_steps"] == 100
+    assert loaded.interface["action_shape"] == [6]
+    assert loaded.interface["observation_shape"] == [16 if open_loop else 15]
+    if open_loop:
+        np.testing.assert_array_equal(loaded.inference["source_times"], np.arange(100))
+        _, next_info = restored_env.step(env_state, jnp.zeros(6, jnp.float32))
+        np.testing.assert_array_equal(next_info.obs[agent.time_index], 1.0)
+        np.testing.assert_allclose(
+            restored_act(next_info.obs, jax.random.key(3)),
+            jnp.full(6, jnp.tanh(-1.0 + 2.0 / 99.0)),
             rtol=1e-6,
             atol=1e-6,
         )

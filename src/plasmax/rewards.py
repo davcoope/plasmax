@@ -59,10 +59,13 @@ def _safe_inverse(value: jax.Array, epsilon: float = 1e-6) -> jax.Array:
 
 # Ramp-down stability barriers (PopDownGym-style log-sigmoid soft barriers on the
 # quantities that go unstable as the current is brought down).
+# Use the grid q minimum, as termination does; the fitted minimum can undershoot.
 _RAMPDOWN_BARRIERS: tuple[RewardFn, ...] = (
     soft_barrier(lambda s: s.plasma.fgw_n_e_line_avg, 1.0),  # Greenwald fraction
     soft_barrier(lambda s: s.plasma.li3, 1.5),  # internal inductance
-    soft_barrier(lambda s: _safe_inverse(s.plasma.q_min), 1.0),  # q_min > 1
+    soft_barrier(
+        lambda s: _safe_inverse(jnp.min(s.plasma.core.q_face)), 1.0
+    ),  # q_min > 1
     soft_barrier(lambda s: s.plasma.beta_N, 3.0),  # beta limit
 )
 
@@ -85,7 +88,7 @@ def rampdown(last_action, state, action, next_state):
 _RAMPUP_LH_BARRIERS: tuple[RewardFn, ...] = (
     soft_barrier(lambda s: s.plasma.fgw_n_e_line_avg, 1.0),  # Greenwald fraction < 1
     soft_barrier(
-        lambda s: _safe_inverse(s.plasma.q_min),
+        lambda s: _safe_inverse(jnp.min(s.plasma.core.q_face)),
         1.0 / 1.6,
     ),  # q_min > ~1.6
 )

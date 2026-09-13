@@ -128,8 +128,6 @@ class PPOConfig:
     vf_coef: float = 0.5
     ent_coef: float = 0.01
     max_grad_norm: float = 0.5
-    # Rejax 0.1.2 RMS state widens under TORAX's global x64 setting; keep its
-    # upstream implementation unchanged and leave normalization disabled.
     normalize_rewards: bool = False
     normalize_observations: bool = False
     hidden_sizes: tuple[int, ...] = (64, 64)

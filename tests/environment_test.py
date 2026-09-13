@@ -519,25 +519,44 @@ class PhysicsRandomizationTest:
         lo, hi = self._RANGE
         assert lo <= float(unwrap_to_env_state(state).phys_params[self._PATH]) <= hi
 
-    def test_relative_range_multiplies_nominal_value(self):
+    @pytest.mark.parametrize("nominal", [0.8, 1.2])
+    def test_relative_samples_scale_absolute_samples_by_nominal(
+        self, nominal: float
+    ) -> None:
+        bounds = (0.5, 1.5)
         config = make_test_config(
             numerics={
                 "t_final": 0.2,
                 "fixed_dt": 0.1,
-                "resistivity_multiplier": 0.8,
+                "resistivity_multiplier": nominal,
             }
         )
-        env = PhysicsRandomizationWrapper(
+        absolute_env = PhysicsRandomizationWrapper(
             make_test_env(
                 config=config,
                 physics_randomization={
-                    self._PATH: PhysicsRandomizationSpec(relative=(0.5, 1.5))
+                    self._PATH: PhysicsRandomizationSpec(absolute=bounds)
                 },
             )
         )
-        state, _ = env.init(jax.random.key(0))
-        state, _ = env.step(state, _ACTION)
-        assert 2.0 <= float(unwrap_to_env_state(state).phys_params[self._PATH]) <= 6.0
+        relative_env = PhysicsRandomizationWrapper(
+            make_test_env(
+                config=config,
+                physics_randomization={
+                    self._PATH: PhysicsRandomizationSpec(relative=bounds)
+                },
+            )
+        )
+        key = jax.random.key(0)
+        absolute_state, _ = absolute_env.init(key)
+        relative_state, _ = relative_env.init(key)
+        absolute_state, _ = absolute_env.step(absolute_state, _ACTION)
+        relative_state, _ = relative_env.step(relative_state, _ACTION)
+        absolute_sample = unwrap_to_env_state(absolute_state).phys_params[self._PATH]
+        relative_sample = unwrap_to_env_state(relative_state).phys_params[self._PATH]
+        np.testing.assert_allclose(
+            relative_sample, nominal * absolute_sample, rtol=1e-12, atol=0.0
+        )
 
     def test_same_initial_key_is_reproducible(self):
         state1, _ = self._env.init(jax.random.key(3))

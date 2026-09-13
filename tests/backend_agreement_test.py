@@ -18,6 +18,21 @@ from benchmarks.backend_agreement import (
 from plasmax.spaces import ObsLayout
 
 
+def test_equilibrium_artifact_defaults_to_shared_consensus():
+    assert Config().equilibrium_initialization_mode == "consensus"
+
+
+def test_newton_backend_must_be_in_backend_labels():
+    with pytest.raises(ValueError, match="newton_backends must be included"):
+        backend_agreement._validate(
+            Config(
+                backends=("tglfnn",),
+                newton_backends=("tglfnn_nr",),
+                require_cpu=False,
+            )
+        )
+
+
 def test_sensor_balanced_mean_averages_profile_before_sensors():
     layout = ObsLayout(
         profile_slices={"profile": slice(0, 2)},

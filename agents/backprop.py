@@ -29,6 +29,7 @@ from agents.direct_gradient import (
     setpoint_theta_row,
     tree_is_finite,
 )
+from plasmax.environment.schema import WorldModelConfig
 from training.envelope_gymnax import to_typed_key
 
 
@@ -466,6 +467,9 @@ class BackpropPolicyAgent:
 
 def source_time_grid(env: Any, num_steps: int) -> jax.Array:
     """Elapsed action-slot times from the source's fixed control schedule."""
+    if isinstance(getattr(env.unwrapped, "plasmax_config", None), WorldModelConfig):
+        # TimeAwareWrapper exposes KSTAR's native transition counter as time.
+        return jnp.arange(num_steps, dtype=jnp.float32)
     config = env.unwrapped.config
     numerics = config.numerics
     initial = float(numerics.t_initial)

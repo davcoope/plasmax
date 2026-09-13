@@ -1,6 +1,7 @@
 """Host orchestration uses real cheap agents and mocked external tracking."""
 
 import dataclasses
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -65,6 +66,7 @@ def tracking(monkeypatch):
             self.logs = []
             self.artifacts = []
             self.finished = False
+            self.finish_calls = 0
             records.append(self)
 
         def log(self, step, index, metrics):
@@ -78,6 +80,8 @@ def tracking(monkeypatch):
 
         def finish(self):
             self.finished = True
+            self.finish_calls += 1
+            self.finish_error = sys.exc_info()[0]
 
     class Artifact:
         def __init__(self, name, type):
@@ -92,7 +96,10 @@ def tracking(monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["policy", "open_loop", "mpc"])
-def test_native_host_runs_compile_log_and_save_each_seed(tmp_path, tracking, kind):
+@pytest.mark.parametrize("num_seeds", [1, 2])
+def test_native_host_runs_compile_log_and_save_each_seed(
+    tmp_path, tracking, kind, num_seeds, monkeypatch
+):
     env = _env()
     if kind == "mpc":
         agent = MPCAgent.create(
@@ -121,25 +128,50 @@ def test_native_host_runs_compile_log_and_save_each_seed(tmp_path, tracking, kin
             agent = BackpropOpenLoopAgent.create(
                 env, num_knots=2, source_times=jnp.asarray([0.0, 1.0]), **kwargs
             )
+    training_keys = []
+    vmapped_functions = []
+    original_train = type(agent).train
+    original_vmap = jax.vmap
+
+    def record_train(current: Any, key: jax.Array) -> Any:
+        jax.debug.callback(lambda value: training_keys.append(np.asarray(value)), key)
+        return original_train(current, key)
+
+    def record_vmap(function: Any, *args: Any, **kwargs: Any) -> Any:
+        vmapped_functions.append(getattr(function, "__name__", None))
+        return original_vmap(function, *args, **kwargs)
+
+    monkeypatch.setattr(type(agent), "train", record_train)
+    monkeypatch.setattr(jax, "vmap", record_vmap)
     config = RunConfig(
-        checkpoint_dir=str(tmp_path), env=runs.EnvConfig(eval_n_envs=1), algorithm=kind
+        checkpoint_dir=str(tmp_path),
+        env=runs.EnvConfig(eval_n_envs=1),
+        algorithm=kind,
+        num_seeds=num_seeds,
     )
     runs.run_native(agent, config, "cheap")
+    assert ("train_one" in vmapped_functions) == (num_seeds > 1)
+    np.testing.assert_array_equal(
+        sorted(tuple(key) for key in training_keys),
+        [jax.random.PRNGKey(seed) for seed in range(3, 3 + num_seeds)],
+    )
     assert agent.eval_callback is None
     logger = tracking[0]
     assert logger.finished
     assert logger.kwargs["mode"] == "online"
-    assert {index for _, index, _ in logger.logs} == {0, 1}
+    assert {index for _, index, _ in logger.logs} == set(range(num_seeds))
+    assert logger.kwargs["seed_ids"] == tuple(range(3, 3 + num_seeds))
     assert logger.summary["run/actual_train_steps"] == 4
     paths = sorted(tmp_path.glob("*.msgpack"))
-    assert len(paths) == 2
-    for seed, path in zip((3, 4), paths, strict=True):
+    assert len(paths) == num_seeds
+    for seed, path in zip(range(3, 3 + num_seeds), paths, strict=True):
+        assert path.name == f"cheap-seed{seed}.msgpack"
         policy = load_policy(path)
         assert policy.metadata["seed"] == seed
         assert policy.metadata["actual_timesteps"] == 4
         assert policy.metadata["config"]["env"]["eval_n_envs"] == 1
         assert len(policy.results["global_step"]) >= 2
-    assert len(logger.artifacts[0].files) == 2
+    assert len(logger.artifacts[0].files) == num_seeds
 
 
 @struct.dataclass
@@ -190,6 +222,99 @@ def test_rejax_launcher_defaults_export_to_default_destination(
     assert options["metadata"]["config"] == dataclasses.asdict(config)
     assert options["metadata"]["actual_train_steps"] == 12
     assert options["deterministic"] == config.env.deterministic_eval
+
+
+@pytest.mark.parametrize("diagnose_numerics", [False, True])
+def test_sac_launcher_trains_native_world_model_and_saves_each_seed(
+    tmp_path, monkeypatch, tracking, diagnose_numerics
+):
+    """Native backends need neither a TORAX name nor TORAX evaluation state."""
+    loaded = []
+
+    def load_envelope(config, backend):
+        loaded.append((config.env.env_setup, backend))
+        return _env()
+
+    monkeypatch.setattr(train_sac, "_load_envelope", load_envelope)
+    monkeypatch.setattr(train_sac, "SeedBufferLogger", runs.SeedBufferLogger)
+    config = train_sac.Config(
+        env=train_sac.EnvConfig(
+            env_setup="kstar_worldmodel", backend=None, eval_n_envs=1
+        ),
+        sac=train_sac.SACConfig(
+            total_timesteps=4,
+            eval_freq=4,
+            num_envs=2,
+            num_epochs=1,
+            buffer_size=8,
+            fill_buffer=0,
+            batch_size=2,
+            hidden_sizes=(4,),
+            diagnose_numerics=diagnose_numerics,
+        ),
+        num_seeds=1 if diagnose_numerics else 2,
+        seed=3,
+        checkpoint_dir=str(tmp_path),
+    )
+
+    train_sac.main(config)
+
+    assert loaded == [("kstar_worldmodel", None)]
+    logger = tracking[0]
+    assert logger.finished
+    assert logger.finish_calls == 1
+    assert "kstar_worldmodel-native-realistic" in logger.kwargs["run_name"]
+    assert {index for _, index, _ in logger.logs} == set(range(config.num_seeds))
+    assert logger.kwargs["seed_ids"] == tuple(range(3, 3 + config.num_seeds))
+    assert logger.summary["run/actual_train_steps"] == 4
+    paths = sorted(tmp_path.glob("*.msgpack"))
+    assert len(paths) == config.num_seeds
+    assert len(logger.artifacts[0].files) == config.num_seeds
+    for seed, path in enumerate(paths):
+        policy = load_policy(path)
+        assert policy.metadata["seed"] == seed + 3
+        assert policy.metadata["config"]["env"]["backend"] is None
+
+
+def test_sac_numerical_diagnostic_rejects_vmapped_launch_before_tracking(tracking):
+    config = train_sac.Config(
+        sac=train_sac.SACConfig(diagnose_numerics=True), num_seeds=2
+    )
+    with pytest.raises(ValueError, match="diagnose_numerics requires num_seeds=1"):
+        train_sac.main(config)
+    assert tracking == []
+
+
+def test_sac_export_failure_finishes_tracking(tmp_path, monkeypatch, tracking):
+    monkeypatch.setattr(train_sac, "_load_envelope", lambda config, backend: _env())
+    monkeypatch.setattr(train_sac, "SeedBufferLogger", runs.SeedBufferLogger)
+
+    def fail_export(*args, **kwargs):
+        raise ValueError("cannot export non-finite policy parameters")
+
+    monkeypatch.setattr(train_sac, "save_run_policies", fail_export)
+    config = train_sac.Config(
+        env=train_sac.EnvConfig(
+            env_setup="kstar_worldmodel", backend=None, eval_n_envs=1
+        ),
+        sac=train_sac.SACConfig(
+            total_timesteps=4,
+            eval_freq=4,
+            num_envs=2,
+            num_epochs=1,
+            buffer_size=8,
+            fill_buffer=0,
+            batch_size=2,
+            hidden_sizes=(4,),
+        ),
+        num_seeds=1,
+        checkpoint_dir=str(tmp_path),
+    )
+    with pytest.raises(ValueError, match="cannot export non-finite policy parameters"):
+        train_sac.main(config)
+    assert len(tracking) == 1
+    assert tracking[0].finish_calls == 1
+    assert tracking[0].finish_error is ValueError
 
 
 def test_native_artifact_upload_uses_the_logger_owned_run(tmp_path, monkeypatch):

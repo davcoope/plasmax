@@ -14,6 +14,7 @@ from flax.linen.initializers import constant
 from rejax.algos.ppo import PPO
 from rejax.networks import MLP, VNetwork
 
+from agents.normalization import EnvelopeNormalizationMixin
 from plasmax.wrappers import unwrap_to_env_state
 from training.envelope_gymnax import GymnaxMultiDiscrete
 
@@ -151,7 +152,7 @@ class ResidualGaussianPolicy(nn.Module):
         return action, action_dist.log_prob(action)
 
 
-class PPOAdapter(PPO):
+class PPOAdapter(EnvelopeNormalizationMixin, PPO):
     """Upstream Rejax PPO with plasmax action-space and eval adapters."""
 
     @classmethod

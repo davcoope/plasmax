@@ -8,15 +8,17 @@ arbitrary order, so :class:`SeedBufferLogger` buffers metrics keyed by
 ``(global_step, run_idx)`` and, once all ``num_seeds`` entries for a step have
 landed, averages across seeds and emits a single wandb log at that step —
 attaching the cross-seed std of every metric so runs carry statistical error
-bars.
+bars, as well as individual curves under ``seeds/{seed_id}/{metric}``.
 
 Adapted from FLAIROx/envelope-bench ``ppo_vmap/logger.py`` (buffer-by-step
 idea), trimmed to plasmax's needs: no HDF5/orbax/nnx dependency, wandb + stdout
-plus an optional final ``.npz`` dump of the full per-seed history.
+plus optional CSV/NPZ history and configuration saved locally and uploaded as
+one W&B history artifact.
 """
 
 import csv
 import json
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -42,7 +44,7 @@ def _finite_mean_and_std(values: list[float], ddof: int) -> tuple[float, float]:
 
 
 class SeedBufferLogger:
-    """Buffers per-seed metrics from a vmapped run and logs their mean ± std.
+    """Log each vmapped seed's metrics alongside their mean ± std.
 
     Args:
         num_seeds: Number of vmapped training seeds. A step is flushed once
@@ -50,8 +52,8 @@ class SeedBufferLogger:
         run_name: wandb run name.
         project/entity/group/mode: wandb.init passthrough.
         config: Config dict recorded to wandb.
-        out_dir: If set, ``finish()`` dumps the full per-seed metric history to
-            ``{out_dir}/{run_name}_history.npz`` (no extra deps; numpy only).
+        out_dir: If set, save CSV/NPZ per-seed history and configuration locally
+            and upload them as one W&B history artifact at ``finish()``.
         print_fn: Sink for the per-step status line (defaults to ``print``).
     """
 
@@ -92,12 +94,13 @@ class SeedBufferLogger:
         self._config = config or {}
         self._run_name = run_name
         self._csv_path: Path | None = None
+        self._config_path: Path | None = None
         self._csv_keys: tuple[str, ...] | None = None
         if self.out_dir is not None:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             self._csv_path = self.out_dir / f"{run_name}_metrics.csv"
-            config_path = self.out_dir / f"{run_name}_config.json"
-            config_path.write_text(
+            self._config_path = self.out_dir / f"{run_name}_config.json"
+            self._config_path.write_text(
                 json.dumps(self._config, indent=2, sort_keys=True, default=str) + "\n"
             )
 
@@ -153,6 +156,8 @@ class SeedBufferLogger:
             log_data[k] = mean[k]
             if self.num_seeds > 1:
                 log_data[f"{k}_seed_std"] = std[k]
+            for run_idx, seed_id in enumerate(self.seed_ids):
+                log_data[f"seeds/{seed_id}/{k}"] = per_run[k][run_idx]
         self._run.log(log_data, step=step)
 
         ret = mean.get("evaluation/return_mean", float("nan"))
@@ -238,6 +243,8 @@ class SeedBufferLogger:
             log_data[name] = mean
             if self.num_seeds > 1:
                 log_data[f"{name}_seed_std"] = std
+            for run_idx, seed_id in enumerate(self.seed_ids):
+                log_data[f"seeds/{seed_id}/{name}"] = float(arrays[name][run_idx])
 
         now = time.time()
         if self._prev_flush_time is not None:
@@ -264,6 +271,17 @@ class SeedBufferLogger:
         self._run.log_artifact(artifact)
 
     def finish(self) -> None:
+        """Publish history and preserve failure status when called in ``finally``."""
+        exit_code = int(sys.exc_info()[0] is not None)
+        try:
+            self._finish_history()
+        except BaseException:
+            exit_code = 1
+            raise
+        finally:
+            self._run.finish(exit_code=exit_code)
+
+    def _finish_history(self) -> None:
         try:
             import jax
 
@@ -279,9 +297,13 @@ class SeedBufferLogger:
             }
             if memory_summary:
                 self.log_once(memory_summary)
-        if self.out_dir is not None and self._history:
+        if self.out_dir is None:
+            return
+
+        steps = sorted(self._history)
+        path: Path | None = None
+        if steps:
             self.out_dir.mkdir(parents=True, exist_ok=True)
-            steps = sorted(self._history)
             keys = list(self._history[steps[0]])
             # arrays: (num_logged_steps, num_seeds) per metric, plus a steps vector.
             dump = {
@@ -293,4 +315,21 @@ class SeedBufferLogger:
             path = self.out_dir / f"{self._run_name}_history.npz"
             np.savez(path, **dump)
             self.print_fn(f"Saved per-seed history: {path}")
-        self._run.finish()
+        artifact = wandb.Artifact(
+            f"{self._run_name}-history",
+            type="history",
+            metadata={
+                "num_seeds": self.num_seeds,
+                "seed_ids": list(self.seed_ids),
+                "num_checkpoints": len(steps),
+            },
+        )
+        for history_path in (
+            self._csv_path,
+            path,
+            self._config_path,
+            self.out_dir / "sweep_trial.json",
+        ):
+            if history_path is not None and history_path.is_file():
+                artifact.add_file(str(history_path))
+        self._run.log_artifact(artifact)

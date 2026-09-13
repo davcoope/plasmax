@@ -275,9 +275,15 @@ def run_native(agent: Any, config: Any, run_name: str) -> None:
             jnp.arange(config.seed, config.seed + config.num_seeds)
         )
         indices = jnp.arange(config.num_seeds, dtype=jnp.int32)
-        train = jax.jit(jax.vmap(train_one))
+        if config.num_seeds == 1:
+            # Keep each independent run's outer control flow unbatched.
+            train = jax.jit(train_one)
+            train_args = (keys[0], indices[0])
+        else:
+            train = jax.jit(jax.vmap(train_one))
+            train_args = (keys, indices)
         start = time.monotonic()
-        lowered = train.lower(keys, indices)
+        lowered = train.lower(*train_args)
         lower_seconds = time.monotonic() - start
         start = time.monotonic()
         lowered.compile()
@@ -286,7 +292,9 @@ def run_native(agent: Any, config: Any, run_name: str) -> None:
         start = time.monotonic()
         # Reuse JIT's cache: direct Compiled calls mishandle TORAX closure
         # constants on the current JAX version (also see train_ppo).
-        states, results = train(keys, indices)
+        states, results = train(*train_args)
+        if config.num_seeds == 1:
+            states, results = jax.tree.map(lambda value: value[None], (states, results))
         jax.block_until_ready((states, results))
         jax.effects_barrier()
         summary = {

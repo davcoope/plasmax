@@ -16,9 +16,10 @@ import pytest
 from helpers import make_test_env
 
 from plasmax import rewards as rewards_lib
+from plasmax.environment.core import EnvState
 
 
-def _make_env_state():
+def _make_env_state() -> EnvState:
     env = make_test_env()
     state, _ = env.init(jax.random.key(0))
     return state
@@ -121,7 +122,7 @@ class SoftBarrierTest:
         np.testing.assert_allclose(gradients, -20.0, atol=2e-4, rtol=0.0)
 
 
-def _with_postout(state, **updates):
+def _with_postout(state: EnvState, **updates: float | jax.Array) -> EnvState:
     """Returns ``state`` with the named postout scalars replaced."""
     new_postout = dataclasses.replace(
         state.plasma.post, **{k: jnp.asarray(v) for k, v in updates.items()}
@@ -131,10 +132,20 @@ def _with_postout(state, **updates):
     )
 
 
+def _with_grid_q_min(state: EnvState, q_min: float | jax.Array) -> EnvState:
+    """Set one face below a fixed safe grid, retaining the fitted diagnostic."""
+    core = dataclasses.replace(
+        state.plasma.core,
+        q_face=jnp.full_like(state.plasma.core.q_face, 4.0).at[1].set(q_min),
+    )
+    sim = dataclasses.replace(state.plasma.sim, core_profiles=core)
+    return dataclasses.replace(state, plasma=dataclasses.replace(state.plasma, sim=sim))
+
+
 class RampdownRewardTest:
     """Barrier-only reward: ~0 inside every stability limit, sharply negative
     as a limit is approached. Checked by perturbing the relevant postout
-    scalars rather than mirroring the implementation's barrier sum."""
+    scalars and face-grid q rather than mirroring the barrier sum."""
 
     @classmethod
     def setup_class(cls):
@@ -160,13 +171,13 @@ class RampdownRewardTest:
         risky = _with_postout(self._state, fgw_n_e_line_avg=1.05)
         assert self._reward(risky) < self._reward(self._state) - 1.0
 
-    def test_penalises_low_q_min(self):
-        risky = _with_postout(self._state, q_min=0.9)
+    def test_penalises_low_q_min(self) -> None:
+        risky = _with_grid_q_min(self._state, 0.9)
         assert self._reward(risky) < self._reward(self._state) - 1.0
 
-    def test_q_min_barrier_gradient_is_finite_at_zero(self):
-        def reward_at(q_min):
-            state = _with_postout(self._state, q_min=q_min)
+    def test_q_min_barrier_gradient_is_finite_at_zero(self) -> None:
+        def reward_at(q_min: jax.Array) -> jax.Array:
+            state = _with_grid_q_min(self._state, q_min)
             return rewards_lib.rampdown(
                 self._action,
                 state,
@@ -174,9 +185,35 @@ class RampdownRewardTest:
                 state,
             )
 
-        gradient = jax.grad(reward_at)(jnp.asarray(0.0))
+        gradient = jax.jit(jax.grad(reward_at))(jnp.asarray(0.0))
 
         assert np.isfinite(float(gradient))
+
+
+@pytest.mark.parametrize("reward", [rewards_lib.rampdown, rewards_lib.lh_transition])
+def test_q_barriers_use_grid_min_instead_of_fitted_min(
+    reward: rewards_lib.RewardFn,
+) -> None:
+    state = _with_grid_q_min(_make_env_state(), 2.0)
+
+    def fitted_reward(q_min: jax.Array) -> jax.Array:
+        next_state = _with_postout(state, q_min=q_min)
+        return reward(state.prev_action, state, state.prev_action, next_state)
+
+    fitted_values = jax.jit(jax.vmap(fitted_reward))(jnp.asarray([2.0, -50.0]))
+    np.testing.assert_allclose(fitted_values[0], fitted_values[1], rtol=0.0, atol=0.0)
+
+    def grid_reward(q_min: jax.Array) -> jax.Array:
+        next_state = _with_grid_q_min(state, q_min)
+        return reward(state.prev_action, state, state.prev_action, next_state)
+
+    values, gradients = jax.jit(jax.vmap(jax.value_and_grad(grid_reward)))(
+        jnp.asarray([2.0, 0.9, 0.0])
+    )
+    assert np.all(np.isfinite(values))
+    assert np.all(np.isfinite(gradients))
+    assert values[1] < values[0] - 1.0
+    assert gradients[1] > 0.0
 
 
 class LHTransitionRewardTest:

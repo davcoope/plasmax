@@ -4,13 +4,62 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import fields
+from typing import Any
 
 import jax.numpy as jnp
+from flax import struct
 from rejax.algos.sac import SAC
 
+from agents.normalization import EnvelopeNormalizationMixin
+from agents.sac_numerics import check_numerics
 
-class SACAdapter(SAC):
+
+class SACAdapter(EnvelopeNormalizationMixin, SAC):
     """Upstream Rejax SAC with callback and deterministic-eval adapters."""
+
+    diagnose_numerics: bool = struct.field(pytree_node=False, default=False)
+
+    def collect_transitions(self, ts: Any) -> Any:
+        if self.diagnose_numerics:
+            check_numerics("before_collection", ts, last_obs=ts.last_obs)
+        ts, batch = super().collect_transitions(ts)
+        if self.diagnose_numerics:
+            check_numerics(
+                "after_collection",
+                ts,
+                **{
+                    f"raw_{name}": getattr(batch, name)
+                    for name in ("obs", "next_obs", "action", "reward")
+                },
+            )
+        return ts, batch
+
+    def update_actor(self, ts: Any, mb: Any) -> Any:
+        if self.diagnose_numerics:
+            check_numerics(
+                "before_actor_update",
+                ts,
+                **{
+                    f"minibatch_{name}": getattr(mb, name)
+                    for name in ("obs", "next_obs", "action", "reward")
+                },
+            )
+        ts, logprob = super().update_actor(ts, mb)
+        if self.diagnose_numerics:
+            check_numerics("after_actor_update", ts, logprob=logprob)
+        return ts, logprob
+
+    def update_critic(self, ts: Any, mb: Any) -> Any:
+        ts = super().update_critic(ts, mb)
+        if self.diagnose_numerics:
+            check_numerics("after_critic_update", ts)
+        return ts
+
+    def update_alpha(self, ts: Any, logprob: Any) -> Any:
+        ts = super().update_alpha(ts, logprob)
+        if self.diagnose_numerics:
+            check_numerics("after_alpha_update", ts)
+        return ts
 
     @classmethod
     def create(cls, **config):
