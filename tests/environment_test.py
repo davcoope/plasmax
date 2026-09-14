@@ -11,11 +11,9 @@ from helpers import (
     DEFAULT_ACTUATOR_SPECS,
     N_RHO,
     NOMINAL_ACTION,
-    checked_jit,
     make_test_config,
     make_test_env,
 )
-from jax.experimental import checkify
 
 from plasmax.environment import core as core_lib
 from plasmax.environment.core import _derive_safe_max_steps
@@ -401,29 +399,43 @@ class DisruptionContractTest:
         ids=("nan", "positive-infinity", "negative-infinity", "float32-overflow"),
     )
     @pytest.mark.parametrize("execution", ["eager", "step", "scan", "batch"])
-    def test_nonfinite_float32_reward_raises(self, monkeypatch, raw_reward, execution):
+    def test_nonfinite_float32_reward_passes_through(
+        self, monkeypatch, raw_reward, execution
+    ):
         _stub_torax_step(monkeypatch)
 
         def reward_fn(state, action, next_state, termination_code):
             del state, action, next_state, termination_code
             return jnp.asarray(raw_reward, dtype=jnp.float64)
 
-        env = make_test_env(reward_fn=reward_fn)
+        env = make_test_env(
+            reward_fn=reward_fn,
+            disruption=DisruptionConfig(q_min_threshold=-1e9, greenwald_threshold=1e9),
+        )
         state, _ = env.init(jax.random.key(0))
-        with pytest.raises(checkify.JaxRuntimeError, match="Reward must be finite"):
-            if execution == "eager":
-                env.step(state, _ACTION)
-            elif execution == "step":
-                checked_jit(env.step)(state, _ACTION)
-            elif execution == "scan":
-                checked_jit(
-                    lambda s: jax.lax.scan(env.step, s, jnp.stack([_ACTION] * 2))
-                )(state)
-            else:
-                checked_jit(jax.vmap(env.step))(
-                    jax.tree.map(lambda x: jnp.stack([x] * 2), state),
-                    jnp.stack([_ACTION] * 2),
-                )
+        if execution == "eager":
+            _, info = env.step(state, _ACTION)
+        elif execution == "step":
+            _, info = jax.jit(env.step)(state, _ACTION)
+        elif execution == "scan":
+            _, info = jax.jit(
+                lambda s: jax.lax.scan(env.step, s, jnp.stack([_ACTION] * 2))
+            )(state)
+        else:
+            _, info = jax.jit(jax.vmap(env.step))(
+                jax.tree.map(lambda x: jnp.stack([x] * 2), state),
+                jnp.stack([_ACTION] * 2),
+            )
+
+        assert info.reward.dtype == jnp.float32
+        expected = np.nan if np.isnan(raw_reward) else np.copysign(np.inf, raw_reward)
+        np.testing.assert_array_equal(info.reward, np.full(info.reward.shape, expected))
+        np.testing.assert_array_equal(
+            info.terminated, np.zeros(info.reward.shape, bool)
+        )
+        np.testing.assert_array_equal(
+            info.termination_code, np.full(info.reward.shape, -1)
+        )
 
     @pytest.mark.parametrize("code", [-1, 1, 2, 3, 4])
     def test_custom_reward_receives_resolved_code_without_transformation(
@@ -450,7 +462,7 @@ class DisruptionContractTest:
 
         env = make_test_env(disruption=disruption, reward_fn=reward_fn)
         state, _ = env.init(jax.random.key(0))
-        next_state, info = checked_jit(env.step)(state, _ACTION)
+        next_state, info = jax.jit(env.step)(state, _ACTION)
         np.testing.assert_array_equal(info.termination_code, code)
         np.testing.assert_array_equal(info.terminated, code != -1)
         np.testing.assert_allclose(
@@ -836,7 +848,7 @@ class PlasmaxEnvTransformContractTest:
         state, _ = env.init(jax.random.key(0))
         actions = jnp.broadcast_to(_ACTION, (2, 2))
 
-        @checked_jit
+        @jax.jit
         def rollout(initial_state, rollout_actions):
             def transition(carry, action):
                 next_state, info = env.step(carry, action)

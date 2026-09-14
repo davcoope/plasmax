@@ -35,7 +35,6 @@ import jax
 import jax.numpy as jnp
 import optax
 import tyro
-from jax.experimental import checkify
 
 from agents.direct_gradient import make_knot_chunk, make_parameterization
 from plasmax.environment.factory import make
@@ -126,19 +125,15 @@ def _make_backward_pass(
     # Match production exactly: TORAX's adaptive-loop transpose supports
     # vmap(grad(single rollout)), rather than grad(vmap(rollout)).
     per_env_value_and_grad = jax.vmap(
-        checkify.checkify(
-            jax.value_and_grad(single_loss, has_aux=True),
-            errors=checkify.user_checks,
-        ),
+        jax.value_and_grad(single_loss, has_aux=True),
         in_axes=(None, 0),
     )
 
     def backward(current_theta: jax.Array, rollout_keys: jax.Array):
-        error, ((losses, alive_steps), per_env_grads) = per_env_value_and_grad(
+        (losses, alive_steps), per_env_grads = per_env_value_and_grad(
             current_theta,
             rollout_keys,
         )
-        checkify.check_error(error)
         mean_grads = jax.tree.map(
             lambda value: jnp.mean(value, axis=0),
             per_env_grads,
@@ -155,14 +150,12 @@ def _make_backward_pass(
             finite,
         )
 
-    checked_backward = jax.jit(checkify.checkify(backward, errors=checkify.user_checks))
+    compiled_backward = jax.jit(backward)
 
-    def run_checked():
-        error, outputs = checked_backward(theta, keys)
-        error.throw()
-        return outputs
+    def run():
+        return compiled_backward(theta, keys)
 
-    return run_checked
+    return run
 
 
 def _peak_bytes_in_use() -> int | None:

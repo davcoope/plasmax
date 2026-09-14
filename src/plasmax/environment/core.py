@@ -16,7 +16,6 @@ from envelope import (
     static_field,
 )
 from jax import numpy as jnp
-from jax.experimental import checkify
 from torax._src import jax_utils
 from torax._src import state as torax_state
 from torax._src.config import build_runtime_params
@@ -639,7 +638,6 @@ class _ToraxDynamics:
             self._reward_fn(env_state, action, new_env_state, termination_code),
             dtype=self._reward_dtype,
         )
-        checkify.check(jnp.isfinite(reward), "Reward must be finite")
 
         return new_env_state, _make_info(
             obs,

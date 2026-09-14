@@ -52,7 +52,6 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 import wandb
-from jax.experimental import checkify
 
 from agents.ppo import PPOAdapter
 from experiments.plotting.wandb_logging import (
@@ -316,7 +315,7 @@ def _train_single(cfg: Config, env, algo):
     algo = algo.with_eval_callback(eval_cb)
 
     rng = jax.random.PRNGKey(cfg.seed)
-    train_fn = jax.jit(checkify.checkify(algo.train, errors=checkify.user_checks))
+    train_fn = jax.jit(algo.train)
 
     lowered, t_lower = _timed("Lowering", lambda: train_fn.lower(rng))
     _, t_compile = _timed("Compiling", lowered.compile)  # warms the jit cache
@@ -327,8 +326,7 @@ def _train_single(cfg: Config, env, algo):
     # trips a const-arg mismatch on JAX 0.10.x ("compiled for N inputs but called
     # with 1") because algo.train closes over many constant arrays.
     def _run():
-        error, (ts, results) = train_fn(rng)
-        error.throw()
+        ts, results = train_fn(rng)
         jax.block_until_ready((ts, results))
         jax.effects_barrier()
         return ts, results
@@ -444,9 +442,7 @@ def _run_vmap(cfg: Config, run_name: str) -> None:
 
     seeds = seed_keys(cfg.seed, cfg.num_seeds)
     run_idxs = jnp.arange(cfg.num_seeds)
-    train_fn = jax.jit(
-        jax.vmap(checkify.checkify(train_one, errors=checkify.user_checks))
-    )
+    train_fn = jax.jit(jax.vmap(train_one))
 
     lowered, t_lower = _timed(
         f"Lowering ({cfg.num_seeds} seeds)", lambda: train_fn.lower(seeds, run_idxs)
@@ -456,8 +452,7 @@ def _run_vmap(cfg: Config, run_name: str) -> None:
     logger.start_time = time.time()
 
     def _run():
-        error, (ts, results) = train_fn(seeds, run_idxs)
-        error.throw()
+        ts, results = train_fn(seeds, run_idxs)
         jax.block_until_ready((ts, results))
         jax.effects_barrier()
         return ts, results

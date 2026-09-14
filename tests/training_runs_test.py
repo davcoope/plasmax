@@ -12,7 +12,6 @@ import pytest
 from envelope import TruncationWrapper
 from flax import struct
 from helpers import CheapBoundaryEnv
-from jax.experimental import checkify
 
 from agents.backprop import BackpropOpenLoopAgent, BackpropPolicyAgent
 from agents.mpc import MPCAgent
@@ -151,7 +150,7 @@ def test_native_host_runs_compile_log_and_save_each_seed(
         num_seeds=num_seeds,
     )
     runs.run_native(agent, config, "cheap")
-    assert ("checked_fun" in vmapped_functions) == (num_seeds > 1)
+    assert ("train_one" in vmapped_functions) == (num_seeds > 1)
     np.testing.assert_array_equal(
         sorted(tuple(key) for key in training_keys),
         [jax.random.PRNGKey(seed) for seed in range(3, 3 + num_seeds)],
@@ -198,52 +197,6 @@ def test_failed_seed_blocks_the_whole_batch_before_any_export(tmp_path, monkeypa
             "failed",
             batched=True,
         )
-    assert not list(tmp_path.iterdir())
-
-
-class NonfiniteRewardEnv(NamedEnv):
-    def step(self, state, action):
-        state, info = super().step(state, action)
-        reward = jnp.where(state.steps > 0, jnp.inf, info.reward)
-        checkify.check(jnp.isfinite(reward), "Reward must be finite")
-        return state, info.update(reward=reward)
-
-
-@pytest.mark.parametrize("num_seeds", [1, 2])
-def test_native_reward_check_blocks_export_and_finishes_tracking(
-    tmp_path, monkeypatch, tracking, num_seeds
-):
-    env = TruncationWrapper(
-        env=NonfiniteRewardEnv(obs_dim=2, action_low=(-1.0,), action_high=(1.0,)),
-        max_steps=2,
-    )
-    agent = MPCAgent.create(
-        env,
-        total_timesteps=2,
-        eval_freq=2,
-        hidden=2,
-        horizon=1,
-        num_samples=1,
-        buffer_size=2,
-        train_batch_size=1,
-        eval_num_episodes=1,
-    )
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("a reward check failure must abort before policy export")
-
-    monkeypatch.setattr(runs, "save_run_policies", unexpected)
-    with pytest.raises(checkify.JaxRuntimeError, match="Reward must be finite"):
-        runs.run_native(
-            agent,
-            RunConfig(
-                checkpoint_dir=str(tmp_path),
-                env=runs.EnvConfig(eval_n_envs=1),
-                num_seeds=num_seeds,
-            ),
-            "nonfinite",
-        )
-    assert tracking[0].finished
     assert not list(tmp_path.iterdir())
 
 

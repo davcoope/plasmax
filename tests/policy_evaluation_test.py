@@ -4,7 +4,7 @@ import jax
 import numpy as np
 import pytest
 from envelope import TruncationWrapper
-from helpers import CheapBoundaryEnv, checked_jit
+from helpers import CheapBoundaryEnv
 
 from agents.policy_io import LoadedPolicy, environment_interface
 from training.evaluation import (
@@ -54,7 +54,7 @@ def test_return_collection_supports_outer_jit_vmap():
     def evaluate(key):
         return evaluate_returns(_act, env, key, num_episodes=2)
 
-    lengths, returns = checked_jit(jax.vmap(evaluate))(
+    lengths, returns = jax.jit(jax.vmap(evaluate))(
         jax.random.split(jax.random.key(3), 2)
     )
     np.testing.assert_array_equal(lengths, np.full((2, 2), 2))
@@ -74,7 +74,7 @@ def test_loaded_policy_evaluation_materializes_fresh_target_spaces_before_jit():
     def evaluate(key):
         return evaluate_policy(policy, target, key, num_episodes=1)[0]
 
-    metrics = checked_jit(evaluate)(jax.random.key(0))
+    metrics = jax.jit(evaluate)(jax.random.key(0))
     np.testing.assert_array_equal(metrics["returns"], [3])
     # The cached target bounds must remain concrete for subsequent exports.
     check_interfaces(policy, target)

@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 from envelope import Environment, TruncationWrapper
 from flax import linen as nn
-from helpers import checked_jit
 
 from plasmax.wrappers import RealisticWrappers
 
@@ -102,7 +101,7 @@ def test_short_training_on_cheap_envelope_env_has_finite_outputs(quantized):
         normalize_rewards=False,
         normalize_observations=False,
     )
-    _, (lengths, returns) = checked_jit(algo.train)(jax.random.PRNGKey(0))
+    _, (lengths, returns) = jax.jit(algo.train)(jax.random.PRNGKey(0))
 
     assert jnp.all(jnp.isfinite(returns))
     assert jnp.all(lengths > 0)
@@ -124,6 +123,6 @@ class PPOTrainSmokeTest:
             normalize_rewards=False,
             normalize_observations=False,
         )
-        _, (lengths, returns) = checked_jit(algo.train)(jax.random.PRNGKey(0))
+        _, (lengths, returns) = jax.jit(algo.train)(jax.random.PRNGKey(0))
         assert jnp.all(jnp.isfinite(returns))
         assert jnp.all(lengths > 0)

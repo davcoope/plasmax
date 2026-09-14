@@ -6,7 +6,6 @@ import json
 
 import jax
 import numpy as np
-from jax.experimental import checkify
 
 from plasmax.environment import make
 from plasmax.wrappers import PhysicsRandomizationWrapper, unwrap_to_env_state
@@ -51,10 +50,7 @@ def _collect_backend(backend: str) -> dict[str, object]:
         )
         return initial, snapshots, complete, terminated
 
-    error, (initial, snapshots, complete, terminated) = jax.jit(
-        checkify.checkify(rollout, errors=checkify.user_checks)
-    )(jax.random.key(0))
-    error.throw()
+    initial, snapshots, complete, terminated = jax.jit(rollout)(jax.random.key(0))
     jax.block_until_ready((initial, snapshots, complete, terminated))
     complete_np = np.asarray(complete)
     terminated_np = np.asarray(terminated)

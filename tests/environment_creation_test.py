@@ -11,7 +11,6 @@ import numpy as np
 import pydantic
 import pytest
 from envelope import AutoResetWrapper, Continuous, Discrete, Environment, VmapWrapper
-from helpers import checked_jit
 from torax._src.torax_pydantic import model_config as torax_model_config
 
 import plasmax
@@ -391,9 +390,7 @@ class LoadScenarioOracleTest:
     def test_envelope_step_returns_state_and_structured_info(self):
         env = OracleWrappers(make(_MOCK_ENV, backend=_MOCK_BACKEND))
         state, _ = env.init(jax.random.key(0))
-        next_state, info = checked_jit(env.step)(
-            state, jnp.zeros(env.action_space.shape)
-        )
+        next_state, info = jax.jit(env.step)(state, jnp.zeros(env.action_space.shape))
         jax.block_until_ready((next_state, info))
         assert next_state.steps == 1
         assert jnp.all(jnp.isfinite(info.obs))

@@ -150,14 +150,12 @@ sanitize invalid inputs before reward arithmetic. Initialization, reset, and
 rollout-padding rewards remain zero. There is no configurable terminal penalty
 or multiplier.
 
-The core casts final rewards to float32 and checks finiteness with
-`checkify.check`; custom rewards are otherwise unchanged. Compiled TORAX callers
-functionalize explicit checks at their outer boundary using
-`checkify.checkify(..., errors=checkify.user_checks)` and call `err.throw()` on the
-host. Collection propagates checks to enclosing callers. Do not enable automatic
-NaN checks for all internal simulator arithmetic.
-`plasmax._checkify_patches` applies two narrow JAX fixes for batched while checks
-and DCE-sink output arity; retain them until upstream supports these contracts.
+The core casts final rewards to float32; custom rewards are otherwise unchanged.
+Nonfinite rewards pass through without an assertion or a termination-code change.
+Evaluation logging reports `evaluation/nonfinite_reward_rate` over valid
+transitions, excluding rollout padding. Do not sanitize rewards, add training
+reward instrumentation, or enable automatic NaN checks inside simulator
+arithmetic. Use ordinary JAX transformations for compiled callers and collection.
 
 `PhysicsRandomizationWrapper` owns its RNG and samples each configured scalar
 before every transition. The core consumes persistent `EnvState.phys_params`;

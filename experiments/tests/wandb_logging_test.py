@@ -8,6 +8,7 @@ import numpy as np
 from envelope import TruncationWrapper
 
 from experiments.plotting.wandb_logging import (
+    _base_metrics,
     _collect_returns_and_lengths,
     _last_valid,
     _masked_band,
@@ -70,6 +71,52 @@ def test_mask_helpers_ignore_invalid_padding_and_select_last_valid():
     np.testing.assert_allclose(std[:2], [4.5, 0.0], rtol=1e-7, atol=0.0)
     assert np.isnan(np.asarray(mean[2]))
     assert np.isnan(np.asarray(std[2]))
+
+
+def test_nonfinite_reward_rate_counts_valid_steps_under_jit_and_vmap():
+    rewards = jnp.asarray(
+        [
+            [[jnp.nan, jnp.inf, -jnp.inf], [1.0, jnp.nan, jnp.inf]],
+            [[1.0, 2.0, jnp.nan], [3.0, jnp.inf, -jnp.inf]],
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            [[jnp.nan, jnp.inf, -jnp.inf], [jnp.nan, jnp.inf, -jnp.inf]],
+        ]
+    )
+    valid = jnp.asarray(
+        [
+            [[True, True, True], [True, False, False]],
+            [[True, True, False], [True, False, False]],
+            [[True, True, True], [True, True, True]],
+            [[False, False, False], [False, False, False]],
+        ]
+    )
+
+    def metrics_for_rewards(reward: jax.Array, valid: jax.Array) -> dict:
+        traj = SimpleNamespace(
+            reward=reward,
+            valid=valid,
+            terminated=jnp.zeros_like(valid),
+            truncated=jnp.zeros_like(valid),
+            info=None,
+        )
+        returns = jnp.sum(jnp.where(valid, reward, 0.0), axis=1)
+        lengths = jnp.sum(valid, axis=1).astype(jnp.float32)
+        return _base_metrics(traj, returns, lengths, train_metrics=None)
+
+    metrics = jax.jit(jax.vmap(metrics_for_rewards))(rewards, valid)
+    np.testing.assert_allclose(
+        metrics["evaluation/nonfinite_reward_rate"],
+        [0.75, 0.0, 0.0, 0.0],
+        rtol=1e-7,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        metrics["evaluation/return_mean"],
+        [np.nan, 3.0, 10.5, 0.0],
+        rtol=1e-7,
+        atol=0.0,
+        equal_nan=True,
+    )
 
 
 def test_termination_metrics_separate_codes_truncation_and_invalid_padding():

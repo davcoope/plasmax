@@ -162,27 +162,17 @@ exhaustion, and `4` (`INVALID_STATE`) for NaN or infinity in checked profiles,
 critical derived outputs, observations, or the checked Greenwald value. When
 multiple conditions hold, priority is
 `4 → 3 → 1 → 2`. Invalid states end the transition immediately; finite negative
-derived values remain allowed. A nonfinite final reward raises `Reward must be
-finite` instead of changing the termination code.
+derived values remain allowed. Rewards are cast to float32 without a finiteness
+assertion or a change to the termination code. Evaluation logging reports
+`evaluation/nonfinite_reward_rate` over valid transitions; rollout padding is
+excluded. Nonfinite rewards are not replaced or filtered from returns.
 
-For compiled TORAX calls, functionalize the explicit reward check at the outer
-boundary using `checkify.user_checks`, and inspect the error on the host:
+Environment steps can be compiled directly:
 
 ```python
-from jax.experimental import checkify
-
-checked_step = jax.jit(checkify.checkify(env.step, errors=checkify.user_checks))
-err, (state, info) = checked_step(state, action)
-err.throw()
+step = jax.jit(env.step)
+state, info = step(state, action)
 ```
-
-Apply the same pattern to an outer training or collection function that calls
-TORAX steps. Collection propagates explicit checks to that caller; it does not
-enable checks for every internal floating-point operation. Eager calls report
-the same reward error directly.
-
-Two narrow [JAX fixes](src/plasmax/_checkify_patches.py) keep explicit checks
-compatible with vmapped solver loops while preserving their existing gradients.
 
 Fixed-shape rollout collection is part of the installed library:
 

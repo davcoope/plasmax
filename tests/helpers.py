@@ -6,8 +6,7 @@ Not collected by pytest (no ``*_test`` suffix); import as ``from helpers
 import ...`` — pytest puts ``tests/`` on ``sys.path`` during collection.
 """
 
-from collections.abc import Callable
-from functools import cached_property, wraps
+from functools import cached_property
 from typing import Any
 
 import jax
@@ -19,7 +18,6 @@ from envelope import (
     InfoContainer,
     static_field,
 )
-from jax.experimental import checkify
 from torax._src.orchestration import run_simulation
 from torax._src.test_utils import default_configs
 from torax._src.torax_pydantic import model_config
@@ -57,21 +55,6 @@ SCALAR_OBS_SPECS = [
     ObsSpec("beta_N", 3.0),
     ObsSpec("f_non_inductive", 1.0),
 ]
-
-
-def checked_jit(function: Callable, **kwargs: Any) -> Callable:
-    """Compile user checks and propagate failures through nested checked calls."""
-    compiled = jax.jit(
-        checkify.checkify(function, errors=checkify.user_checks), **kwargs
-    )
-
-    @wraps(function)
-    def checked(*args: Any, **kwargs: Any) -> Any:
-        error, result = compiled(*args, **kwargs)
-        checkify.check_error(error)
-        return result
-
-    return checked
 
 
 class CheapBoundaryState(FrozenPyTreeNode):

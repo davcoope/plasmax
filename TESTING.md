@@ -150,15 +150,14 @@ Tests cover:
 - zero value and reward-branch gradient for invalid-state built-in rewards;
 - custom rewards receiving `(state, action, next_state, termination_code)` and
   returning the final reward without an environment transformation;
-- explicit finiteness errors after the float32 reward cast;
+- nonfinite rewards passing through the float32 cast without changing termination;
+- evaluation nonfinite-reward rates excluding invalid rollout padding;
 - bare construction plus explicit realistic/oracle composition;
 - wrapper default resolution and persistent physics updates/reset behavior.
 
-Compiled TORAX tests use explicit `checkify.user_checks` around the outer tested
-function. The `checked_jit` helper in `tests/helpers.py` propagates errors with
-`checkify.check_error`; host callers inspect errors with `err.throw()`. Keep
-eager, JIT, vmap, scan, and gradient contracts covered without enabling automatic
-NaN checks inside simulator arithmetic.
+Keep eager, JIT, vmap, scan, and gradient contracts covered with ordinary JAX
+transformations. Reward finiteness is an evaluation diagnostic, not an assertion
+inside simulator arithmetic.
 
 Initialization tests cover all task references from an unrelated working
 directory, typed YAML loading, numeric/scientific notation, stable serialization,

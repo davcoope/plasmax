@@ -101,8 +101,7 @@ def make(
     Omit ``backend`` for ``"kstar_worldmodel"``. Apply wrappers explicitly,
     for example ``RealisticWrappers(make(env, backend), max_steps=100)``.
     A custom reward receives ``(state, action, next_state, termination_code)``
-    and returns the final scalar reward. Compiled TORAX calls must functionalize
-    reward-finiteness checks with ``checkify.checkify(..., errors=user_checks)``.
+    and returns the final scalar reward, which is cast to float32.
     """
     _validate_options(env, backend, reward)
     cfg = parse_env_and_backend(env, backend)

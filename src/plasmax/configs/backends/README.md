@@ -92,7 +92,8 @@ outputs (including `P_cyclotron_e`, `P_SOL_total`, and `P_LH`) stops advancement
 with code `4` (`INVALID_STATE`). Nonfinite observations or the checked
 Greenwald value also produce code `4`, which takes precedence over code `3` and
 physical disruption codes. Built-in rewards return zero for invalid states.
-A nonfinite final float32 reward instead raises `Reward must be finite`.
+Final rewards are cast to float32 without a finiteness assertion. Evaluation
+logging reports nonfinite rewards separately from invalid physical states.
 
 All solvers use **Pereverzev–Corrigan artificial diffusion**
 (`use_pereverzev`, `chi_pereverzev`, `D_pereverzev`): a large artificial

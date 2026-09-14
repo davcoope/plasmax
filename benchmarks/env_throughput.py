@@ -26,7 +26,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import tyro
-from jax.experimental import checkify
 
 from plasmax.environment.factory import make
 from plasmax.wrappers import PhysicsRandomizationWrapper, unwrap_to_env_state
@@ -105,19 +104,16 @@ def _make_run(
 ) -> Callable[[], Any]:
     keys = jax.random.split(jax.random.key(SEED), n_envs)
 
-    checked_rollout = checkify.checkify(
-        lambda key: _rollout(env, key, n_steps, reset_on_boundary),
-        errors=checkify.user_checks,
-    )
+    def rollout(key: jax.Array):
+        return _rollout(env, key, n_steps, reset_on_boundary)
+
     scalar = n_envs == 1 and not vmap_scalar
-    checked_run = jax.jit(checked_rollout if scalar else jax.vmap(checked_rollout))
+    compiled_run = jax.jit(rollout if scalar else jax.vmap(rollout))
 
-    def run_checked():
-        error, outputs = checked_run(keys[0] if scalar else keys)
-        error.throw()
-        return outputs
+    def run():
+        return compiled_run(keys[0] if scalar else keys)
 
-    return run_checked
+    return run
 
 
 def _time_run(env: Any, cfg: Config, n_envs: int) -> Timing:

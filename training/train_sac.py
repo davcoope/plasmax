@@ -27,7 +27,6 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 import wandb
-from jax.experimental import checkify
 
 from agents.sac import SACAdapter
 from experiments.plotting.wandb_logging import make_buffered_seed_callback
@@ -223,12 +222,10 @@ def main(cfg: Config) -> None:
         run_indices = jnp.arange(cfg.num_seeds, dtype=jnp.int32)
         if cfg.sac.diagnose_numerics:
             # Keep failure-only callbacks conditional; vmap evaluates both branches.
-            train = jax.jit(checkify.checkify(train_one, errors=checkify.user_checks))
+            train = jax.jit(train_one)
             train_args = (keys[0], run_indices[0])
         else:
-            train = jax.jit(
-                jax.vmap(checkify.checkify(train_one, errors=checkify.user_checks))
-            )
+            train = jax.jit(jax.vmap(train_one))
             train_args = (keys, run_indices)
 
         start = time.monotonic()
@@ -240,8 +237,7 @@ def main(cfg: Config) -> None:
         logger.start_time = time.time()
 
         start = time.monotonic()
-        error, (train_states, results) = train(*train_args)
-        error.throw()
+        train_states, results = train(*train_args)
         if cfg.sac.diagnose_numerics:
             train_states, results = jax.tree.map(
                 lambda value: value[None], (train_states, results)

@@ -201,6 +201,10 @@ def _base_metrics(traj, episode_returns, episode_lengths, train_metrics) -> dict
         "evaluation/return_min": episode_returns.min(),
         "evaluation/return_max": episode_returns.max(),
         "evaluation/episode_length_mean": episode_lengths.mean(),
+        "evaluation/nonfinite_reward_rate": jnp.sum(
+            traj.valid & ~jnp.isfinite(traj.reward)
+        )
+        / jnp.maximum(jnp.sum(traj.valid), 1),
         **_termination_metrics(traj, episode_returns, episode_lengths),
     }
     if train_metrics is not None:

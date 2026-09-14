@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from envelope import AutoResetWrapper, PooledInitVmapWrapper, WrappedState, Wrapper
-from jax.experimental import checkify
 from torax._src.output_tools import output
 from torax._src.state import SimError
 from torax._src.torax_pydantic import model_config
@@ -236,8 +235,7 @@ def _collect_episode_impl(
     return trajectory
 
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 3, 4))
-@functools.partial(checkify.checkify, errors=checkify.user_checks)
+@functools.partial(jax.jit, static_argnames=("act", "static_env", "num_steps", "lean"))
 def _collect_episode_jit(
     act: Callable[[jax.Array, jax.Array], jax.Array],
     static_env: _StaticEnvironment,
@@ -260,23 +258,15 @@ def collect_episode(
     A boundary transition is retained. Later slots freeze the scan carry and are
     marked invalid, so callers can keep static shapes without starting another
     episode or stepping an already-finished simulator.
-
-    Raises reward-finiteness errors eagerly. Enclosing compiled callers must
-    apply ``checkify.checkify(..., errors=checkify.user_checks)``.
     """
     _reject_autoreset(env)
-    error, trajectory = _collect_episode_jit(
-        act, _StaticEnvironment(env), rng, num_steps, lean
-    )
-    checkify.check_error(error)
-    return trajectory
+    return _collect_episode_jit(act, _StaticEnvironment(env), rng, num_steps, lean)
 
 
 @functools.partial(
     jax.jit,
-    static_argnums=(0, 1, 3, 4, 5),
+    static_argnames=("act", "static_env", "num_steps", "n_seeds", "lean"),
 )
-@functools.partial(checkify.checkify, errors=checkify.user_checks)
 def _collect_episodes_jit(
     act: Callable[[jax.Array, jax.Array], jax.Array],
     static_env: _StaticEnvironment,
@@ -312,16 +302,11 @@ def collect_episodes(
     however, a vmapped ``lax.cond`` may evaluate inactive branch work as part of
     the compiled SIMD computation; callers should not interpret masking as a
     per-lane compute-saving guarantee.
-
-    Enclosing compiled callers must apply ``checkify.checkify`` with
-    ``errors=checkify.user_checks`` and raise its returned error.
     """
     _reject_autoreset(env)
-    error, trajectory = _collect_episodes_jit(
+    return _collect_episodes_jit(
         act, _StaticEnvironment(env), rng, num_steps, n_seeds, lean
     )
-    checkify.check_error(error)
-    return trajectory
 
 
 def make_collect_callback(num_steps: int, n_seeds: int = 1) -> Callable:

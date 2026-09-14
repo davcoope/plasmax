@@ -15,8 +15,6 @@ from envelope import (
     InfoContainer,
     static_field,
 )
-from helpers import checked_jit
-from jax.experimental import checkify
 
 from plasmax.rollout import (
     TrajectoryStep,
@@ -117,15 +115,6 @@ class _PhysicalBoundaryEnv(_BoundaryEnv):
             low=jnp.asarray([10.0], jnp.float32),
             high=jnp.asarray([20.0], jnp.float32),
         )
-
-
-class _CheckedBoundaryEnv(_BoundaryEnv):
-    """Exercise collector error propagation without a physical solve."""
-
-    def step(self, state, action):
-        next_state, info = super().step(state, action)
-        checkify.check(jnp.isfinite(info.reward), "Reward must be finite")
-        return next_state, info
 
 
 class _SeedBoundaryState(FrozenPyTreeNode):
@@ -335,34 +324,38 @@ def test_collect_rejects_autoresetting_environment():
 
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("outer_jit", [False, True])
-def test_collector_propagates_reward_errors(batched, outer_jit):
+@pytest.mark.parametrize("reward", [np.nan, np.inf, -np.inf])
+def test_collector_preserves_nonfinite_rewards(batched, outer_jit, reward):
     def collect(key):
         def policy(obs, rng):
             del obs, rng
-            return jnp.asarray([jnp.nan], jnp.float32)
+            return jnp.asarray([reward], jnp.float32)
 
         if batched:
-            return collect_episodes(policy, _CheckedBoundaryEnv(), key, 2, 3)
-        return collect_episode(policy, _CheckedBoundaryEnv(), key, 2)
+            return collect_episodes(policy, _BoundaryEnv(), key, 2, 3)
+        return collect_episode(policy, _BoundaryEnv(), key, 2)
 
-    run = checked_jit(collect) if outer_jit else collect
-    with pytest.raises(checkify.JaxRuntimeError, match="Reward must be finite"):
-        run(jax.random.key(0))
+    run = jax.jit(collect) if outer_jit else collect
+    trajectory = run(jax.random.key(0))
+    np.testing.assert_array_equal(
+        trajectory.reward, np.full(trajectory.reward.shape, reward)
+    )
+    np.testing.assert_array_equal(
+        trajectory.valid, np.ones(trajectory.reward.shape, dtype=bool)
+    )
 
 
-def test_checked_collection_composes_with_backprop_and_batching():
+def test_collection_composes_with_backprop_and_batching():
     def objective(action):
         def policy(obs, key):
             del obs, key
             return action[None]
 
-        trajectory = collect_episodes(
-            policy, _CheckedBoundaryEnv(), jax.random.key(2), 3, 2
-        )
+        trajectory = collect_episodes(policy, _BoundaryEnv(), jax.random.key(2), 3, 2)
         return trajectory.reward.sum()
 
     actions = jnp.asarray([0.0, 0.5], jnp.float32)
-    values, gradients = checked_jit(jax.vmap(jax.value_and_grad(objective)))(actions)
+    values, gradients = jax.jit(jax.vmap(jax.value_and_grad(objective)))(actions)
     # Each lane's three cumulative rewards contribute (1 + 2 + 3) da.
     np.testing.assert_allclose(gradients, [12.0, 12.0], rtol=1e-6, atol=0.0)
     np.testing.assert_allclose(values[1] - values[0], 6.0, rtol=1e-6, atol=0.0)
