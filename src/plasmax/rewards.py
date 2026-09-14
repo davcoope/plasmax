@@ -39,10 +39,13 @@ def soft_barrier(
     quantity: Quantity, limit: float, *, slope: float = 40.0, threshold: float = 0.9
 ) -> RewardFn:
     """Soft penalty enforcing ``quantity(next_state) <= limit`` (PopDownGym-style):
-    ~0 while below ``threshold * limit``, dropping sharply (log-sigmoid) toward 0."""
+    ~0 below ``threshold * limit``, increasingly negative above it. The ReLU
+    floor keeps the normalized quantity nonnegative without capping penalties
+    or their gradients for large violations.
+    """
 
     def reward(last_action, state, action, next_state):
-        x = jnp.clip(quantity(next_state) / limit, 0.0, 1.1)
+        x = jax.nn.relu(quantity(next_state) / limit)
         return jax.nn.log_sigmoid(-slope * (x - threshold))
 
     return reward
@@ -56,10 +59,13 @@ def _safe_inverse(value: jax.Array, epsilon: float = 1e-6) -> jax.Array:
 
 # Ramp-down stability barriers (PopDownGym-style log-sigmoid soft barriers on the
 # quantities that go unstable as the current is brought down).
+# Use the grid q minimum, as termination does; the fitted minimum can undershoot.
 _RAMPDOWN_BARRIERS: tuple[RewardFn, ...] = (
     soft_barrier(lambda s: s.plasma.fgw_n_e_line_avg, 1.0),  # Greenwald fraction
     soft_barrier(lambda s: s.plasma.li3, 1.5),  # internal inductance
-    soft_barrier(lambda s: _safe_inverse(s.plasma.q_min), 1.0),  # q_min > 1
+    soft_barrier(
+        lambda s: _safe_inverse(jnp.min(s.plasma.core.q_face)), 1.0
+    ),  # q_min > 1
     soft_barrier(lambda s: s.plasma.beta_N, 3.0),  # beta limit
 )
 
@@ -82,7 +88,7 @@ def rampdown(last_action, state, action, next_state):
 _RAMPUP_LH_BARRIERS: tuple[RewardFn, ...] = (
     soft_barrier(lambda s: s.plasma.fgw_n_e_line_avg, 1.0),  # Greenwald fraction < 1
     soft_barrier(
-        lambda s: _safe_inverse(s.plasma.q_min),
+        lambda s: _safe_inverse(jnp.min(s.plasma.core.q_face)),
         1.0 / 1.6,
     ),  # q_min > ~1.6
 )
@@ -94,9 +100,10 @@ def lh_transition(last_action, state, action, next_state, *, t_final: float = 10
     ITER's L–H transition is timed at/after Ip flat-top, not throughout the
     ramp, so this does NOT reward crossing early:
 
-    * P_SOL/P_LH shaping, time-weighted ``(t/t_final)**2`` — an early crossing
-      contributes almost nothing; the reward for being above threshold only
-      matters near the end of the ramp.
+    * ReLU P_SOL/P_LH shaping, time-weighted ``(t/t_final)**2`` — an early
+      crossing contributes almost nothing; the reward for being above
+      threshold only matters near the end of the ramp. Positive ratios remain
+      uncapped so their gradients persist above the L–H threshold.
     * Discrete ``H_MODE`` bonus, time-weighted and summed each step, so
       *sustaining* H-mode pays more than a single crossing.
     * Back-transition penalty (``TRANSITIONING_TO_L_MODE``) discourages sitting
@@ -113,7 +120,7 @@ def lh_transition(last_action, state, action, next_state, *, t_final: float = 10
     Mode = pedestal_transition_state_lib.ConfinementMode
     t_frac = next_state.plasma.t / t_final
 
-    ratio = jnp.clip(next_state.plasma.P_SOL_total / next_state.plasma.P_LH, 0.0, 1.5)
+    ratio = jax.nn.relu(next_state.plasma.P_SOL_total / next_state.plasma.P_LH)
     h_bonus = jnp.where(mode == Mode.H_MODE, 1.0, 0.0)
     back = jnp.where(mode == Mode.TRANSITIONING_TO_L_MODE, 1.0, 0.0)
 

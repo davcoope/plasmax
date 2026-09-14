@@ -5,7 +5,13 @@ config (geometry plumbing, ion mix, actuators, observations, disruption); it
 overlays only its scenario-specific deltas.
 """
 
-from plasmax.environment.merge import _merge_env_and_backend
+from pathlib import Path
+
+import pytest
+import yaml
+
+from plasmax.environment import registry
+from plasmax.environment.merge import _merge_env_and_backend, load_env_layers
 
 _STEP_ENV = "step/spp_001_ec_hd/flattop"
 _STEP_BACKEND = "bohm_gyrobohm_step"
@@ -15,18 +21,85 @@ def _merge(env, backend="cgm"):
     return _merge_env_and_backend(env, backend)
 
 
+class ScenarioLayerMergeTest:
+    def test_shared_base_and_phase_overrides_preserve_nested_fields(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fragments: dict[str, dict[str, object]] = {
+            "tokamaks/test_device.yaml": {
+                "torax": {
+                    "numerics": {"t_final": 1.0, "fixed_dt": 0.25},
+                    "pedestal": {"T_i_ped": 1.0, "T_e_ped": 2.0},
+                },
+                "observations": {"realistic": {"resolution": {"T_e": 1, "T_i": 2}}},
+            },
+            "envs/test_device/test_scenario/base.yaml": {
+                "tokamak": "test_device",
+                "scenario": "test_scenario",
+                "torax": {
+                    "numerics": {"t_final": 2.0},
+                    "pedestal": {"T_i_ped": 3.0},
+                },
+            },
+            "envs/test_device/test_scenario/rampup.yaml": {
+                "torax": {"numerics": {"t_final": 3.0}},
+                "observations": {"realistic": {"resolution": {"T_e": 3}}},
+            },
+            "envs/test_device/test_scenario/flattop.yaml": {
+                "torax": {"numerics": {"t_final": 4.0}},
+                "observations": {"realistic": {"resolution": {"T_e": 4}}},
+            },
+            "wrappers.yaml": {
+                "observations": {"realistic": {"resolution": {"T_e": 5}}},
+            },
+        }
+        for relative_path, fragment in fragments.items():
+            path = tmp_path / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(yaml.safe_dump(fragment))
+        monkeypatch.setattr(registry, "CONFIGS_DIR", tmp_path)
+        monkeypatch.setattr(
+            registry,
+            "ENV_ALIASES",
+            {
+                f"test_device/test_scenario/{phase}": (
+                    tmp_path / "envs/test_device/test_scenario" / f"{phase}.yaml"
+                )
+                for phase in ("rampup", "flattop")
+            },
+        )
+
+        for phase, t_final in (("rampup", 3.0), ("flattop", 4.0)):
+            merged = load_env_layers(f"test_device/test_scenario/{phase}")
+            # The shared base overrides one device leaf and retains its sibling.
+            assert merged["torax"]["pedestal"] == {"T_i_ped": 3.0, "T_e_ped": 2.0}
+            # Each phase wins over the base without dropping device defaults.
+            assert merged["torax"]["numerics"] == {
+                "t_final": t_final,
+                "fixed_dt": 0.25,
+            }
+            # Wrappers apply last, while unrelated nested fields still survive.
+            assert merged["observations"]["realistic"]["resolution"] == {
+                "T_e": 5,
+                "T_i": 2,
+            }
+            assert merged["tokamak"] == "test_device"
+            assert merged["scenario"] == "test_scenario"
+
+
 class TokamakMergeTest:
-    def test_actuators_and_disruption_inherited_from_tokamak(self):
-        # Actuators/disruption live only in tokamaks/iter.yaml now; every ITER
-        # scenario inherits the unified values.
-        for env in (
-            "iter/hybrid/flattop",
-            "iter/baseline/rampup",
-            "iter/advanced/flattop",
-        ):
+    def test_actuator_overrides_and_disruption_inherited_from_tokamak(self):
+        # Flat-top experiments widen the NBI ceiling to the transferred 51 MW
+        # operating point; other phases retain the 50 MW tokamak default.
+        expected_nbi_high = {
+            "iter/hybrid/flattop": 51.0e6,
+            "iter/baseline/rampup": 50.0e6,
+            "iter/advanced/flattop": 51.0e6,
+        }
+        for env, nbi_high in expected_nbi_high.items():
             m = _merge(env)
             acts = {a["name"]: a for a in m["actuators"]}
-            assert acts["P_nbi"]["high"] == 50.0e6
+            assert acts["P_nbi"]["high"] == nbi_high
             assert acts["rho_eccd"]["low"] == 0.0
             assert m["disruption"]["greenwald_metric"] == "volume_avg"
             assert m["disruption"]["greenwald_threshold"] == 1.0
@@ -58,16 +131,14 @@ class TokamakMergeTest:
         assert flattop["torax"]["pedestal"]["T_i_ped"] == 4.5
         for merged in (rampup, flattop):
             assert merged["physics_randomization"]
-        # The ramp source is exact upstream. The hot 51 MW source is split into
-        # two exposed controls while preserving its shape and electron share.
+        # The ramp source is exact upstream. The flat top uses the transferred
+        # TORAX-reference vector with all 51 MW in generic NBI heat.
         assert rampup["torax"]["sources"]["generic_heat"]["P_total"] == 20.0e6
-        assert flattop["torax"]["sources"]["generic_heat"]["P_total"] == (
-            23_314_285.714285713
-        )
+        assert flattop["torax"]["sources"]["generic_heat"]["P_total"] == 51.0e6
         rampup_actuators = {item["name"]: item for item in rampup["actuators"]}
         flattop_actuators = {item["name"]: item for item in flattop["actuators"]}
         assert rampup_actuators["P_nbi"]["init"] == 20.0e6
-        assert flattop_actuators["P_nbi"]["init"] == 23_314_285.714285713
+        assert flattop_actuators["P_nbi"]["init"] == 51.0e6
         # Phase deltas differ and win over base.
         assert rampup["torax"]["numerics"]["t_final"] == 100.0
         assert rampup["torax"]["numerics"]["fixed_dt"] == 0.1
@@ -192,29 +263,6 @@ class SparcMergeTest:
             acts = {a["name"]: a for a in m["actuators"]}
             assert acts["P_nbi"]["high"] == 25.0e6
             assert m["disruption"]["greenwald_threshold"] == 1.1
-
-    def test_scenario_base_shared_across_phases_with_phase_overrides(self):
-        rampup = _merge("sparc/prd/rampup")
-        flattop = _merge("sparc/prd/flattop")
-        # Base-only physics (pedestal, sources, constant CD fraction) reaches
-        # every phase identically.
-        for m in (rampup, flattop):
-            assert m["torax"]["pedestal"]["T_i_ped"] == 4.2825268
-            assert m["torax"]["sources"]["generic_heat"]["P_total"] == 11.0e6
-            assert (
-                m["torax"]["sources"]["generic_current"]["fraction_of_total_current"]
-                == 0.1
-            )
-        # Phase deltas differ and win over base.
-        assert rampup["torax"]["numerics"]["t_final"] == 10.0
-        assert flattop["torax"]["numerics"]["t_final"] == 15.0
-        assert "geometry_configs" in rampup["torax"]["geometry"]
-        assert (
-            flattop["torax"]["geometry"]["geometry_file"]
-            == "references/sparc_prd_freegs_20221013.eqdsk"
-        )
-        # Raw composition retains scenario provenance for the final loader.
-        assert rampup["scenario"] == "prd"
 
     def test_reduced_field_uses_its_own_geometry(self):
         m = _merge("sparc/reduced_field/rampup")

@@ -128,8 +128,6 @@ class PPOConfig:
     vf_coef: float = 0.5
     ent_coef: float = 0.01
     max_grad_norm: float = 0.5
-    # Rejax 0.1.2 RMS state widens under TORAX's global x64 setting; keep its
-    # upstream implementation unchanged and leave normalization disabled.
     normalize_rewards: bool = False
     normalize_observations: bool = False
     hidden_sizes: tuple[int, ...] = (64, 64)
@@ -155,13 +153,15 @@ class Config:
     env: EnvConfig = dataclasses.field(default_factory=EnvConfig)
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
     wandb: WandbConfig = dataclasses.field(default_factory=WandbConfig)
-    seed: int = 0  # base PRNG seed; per-seed keys are split from this
+    seed: int = 0  # first numeric PRNG seed; vmapped runs use consecutive IDs
     num_seeds: int = 1  # >1 vmaps that many independent training runs
     algorithm: Literal["ppo"] = "ppo"
     study: str = "debug"
     # Optional dir to dump per-seed metric history as an .npz (numpy only,
     # num_seeds > 1 only).
     history_dir: str | None = None
+    # Optional display name and policy destination; default: outputs/policies.
+    run_name: str | None = None
     checkpoint_dir: str | None = None
 
 
@@ -405,6 +405,13 @@ def _run_single(cfg: Config, run_name: str) -> None:
         )
         _print_transfer_metrics(transfer_summary)
         wandb.log(transfer_summary)
+        summary_path = write_transfer_summary(
+            cfg.history_dir,
+            run_name,
+            transfer_summary,
+        )
+        if summary_path is not None:
+            print(f"Saved transfer summary to {summary_path}", flush=True)
 
     wandb.finish()
     print("Done.")
@@ -444,6 +451,10 @@ def _run_vmap(cfg: Config, run_name: str) -> None:
         num_steps=episode_steps,
         n_seeds=cfg.env.eval_n_envs,
         kind=kind,
+        # Returns-only TORAX evaluation still benefits from stripping emitted
+        # SimState fields that no scalar metric reads. World-model states do
+        # not support TORAX's lean-state projection.
+        lean=not is_world_model,
         eval_rng=jax.random.PRNGKey(cfg.env.eval_seed),
         deterministic=cfg.env.deterministic_eval,
     )
@@ -492,7 +503,7 @@ def _run_vmap(cfg: Config, run_name: str) -> None:
         log_once.update(transfer_summary)
         write_transfer_summary(cfg.history_dir, run_name, transfer_summary)
 
-    save_run_policies(
+    checkpoints = save_run_policies(
         algo,
         ts,
         cfg,
@@ -501,6 +512,13 @@ def _run_vmap(cfg: Config, run_name: str) -> None:
         results=results,
         metrics=log_once,
     )
+    if checkpoints:
+        artifact = wandb.Artifact(run_name, type="model")
+        for checkpoint in checkpoints:
+            artifact.add_file(str(checkpoint))
+            print(f"Saved checkpoint to {checkpoint}", flush=True)
+        logger.log_artifact(artifact)
+
     logger.log_once(log_once)
     logger.finish()
     print("Done.")
@@ -508,7 +526,7 @@ def _run_vmap(cfg: Config, run_name: str) -> None:
 
 def main(cfg: Config) -> None:
     validate_seeds(cfg.env.backend, cfg.num_seeds)
-    run_name = _run_name(cfg)
+    run_name = cfg.run_name or _run_name(cfg)
     if cfg.num_seeds > 1:
         _run_vmap(cfg, run_name)
     else:

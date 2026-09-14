@@ -16,7 +16,7 @@ import dataclasses
 import math
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from scripts._runtime import set_default_xla_flags
 
@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tyro
+import wandb
 
 from agents.sac import SACAdapter
 from experiments.plotting.wandb_logging import make_buffered_seed_callback
@@ -42,7 +43,7 @@ from training.vmap_logging import SeedBufferLogger
 @dataclasses.dataclass
 class EnvConfig:
     env_setup: str = "iter/hybrid/flattop"
-    backend: str = "bohm_gyrobohm"
+    backend: str | None = "bohm_gyrobohm"
     transfer_backend: str | None = None
     reward: str | None = None
     variant: Literal["oracle", "realistic"] = "realistic"
@@ -70,10 +71,9 @@ class SACConfig:
     polyak: float = 0.995
     target_update_freq: int = 1
     max_grad_norm: float = 10.0
-    # Rejax 0.1.2 RMS state widens under TORAX's global x64 setting. Keep the
-    # upstream implementation unchanged and leave both normalizers disabled.
     normalize_observations: bool = False
     normalize_rewards: bool = False
+    diagnose_numerics: bool = False
 
 
 @dataclasses.dataclass
@@ -93,11 +93,13 @@ class Config:
     seed: int = 0
     num_seeds: int = 10
     history_dir: str | None = None
-    checkpoint_dir: str | None = None
     algorithm: Literal["sac"] = "sac"
     study: str = "debug"
     # Optional study guard; the generic launcher accepts explicit task overrides.
     strict_phase_reward: bool = False
+    # Optional display name and policy destination; default: outputs/policies.
+    run_name: str | None = None
+    checkpoint_dir: str | None = None
 
 
 def _fmt_steps(steps: int) -> str:
@@ -105,10 +107,23 @@ def _fmt_steps(steps: int) -> str:
     return f"{mantissa}e{int(exponent)}"
 
 
-def _sac_extra_metrics(ts, train_metrics):
+def _sac_extra_metrics(ts: Any, train_metrics: Any) -> dict[str, jax.Array]:
     del train_metrics
+
+    def finite(tree: Any) -> jax.Array:
+        return jnp.all(
+            jnp.stack([jnp.all(jnp.isfinite(value)) for value in jax.tree.leaves(tree)])
+        ).astype(jnp.float32)
+
+    temperature = jnp.exp(ts.alpha_ts.params["log_alpha"])
     return {
-        "train/replay_buffer_size": ts.replay_buffer.num_entries.astype(jnp.float32)
+        "train/replay_buffer_size": ts.replay_buffer.num_entries.astype(jnp.float32),
+        "train/actor_finite": finite(ts.actor_ts.params),
+        "train/critic_finite": finite(ts.critic_ts.params),
+        "train/obs_rms_finite": finite(ts.obs_rms_state),
+        "train/reward_rms_finite": finite(ts.rew_rms_state),
+        "train/temperature_finite": finite(temperature),
+        "train/temperature": temperature,
     }
 
 
@@ -134,6 +149,7 @@ def _build_algo(cfg: Config, env: EnvelopeGymnax) -> SACAdapter:
         max_grad_norm=cfg.sac.max_grad_norm,
         normalize_observations=cfg.sac.normalize_observations,
         normalize_rewards=cfg.sac.normalize_rewards,
+        diagnose_numerics=cfg.sac.diagnose_numerics,
     )
 
 
@@ -141,7 +157,7 @@ def _backend_name(alias_or_path: str) -> str:
     return Path(resolve_backend(alias_or_path)).stem
 
 
-def _load_envelope(cfg: Config, backend: str):
+def _load_envelope(cfg: Config, backend: str | None):
     return (RealisticWrappers if cfg.env.variant == "realistic" else OracleWrappers)(
         make(
             cfg.env.env_setup,
@@ -154,20 +170,25 @@ def _load_envelope(cfg: Config, backend: str):
 
 def main(cfg: Config) -> None:
     validate_seeds(cfg.env.backend, cfg.num_seeds)
+    if cfg.sac.diagnose_numerics and cfg.num_seeds != 1:
+        raise ValueError("sac.diagnose_numerics requires num_seeds=1")
     if cfg.strict_phase_reward:
         validate_reward(cfg.env.env_setup, cfg.env.reward, cfg.env.backend)
 
-    run_name = run_slug(
-        cfg.algorithm,
-        cfg.env.env_setup,
-        cfg.env.backend,
-        cfg.env.variant,
-        cfg.env.reward,
-        cfg.num_seeds,
-    )
-    if cfg.env.transfer_backend is not None:
-        run_name = f"{run_name}-to-{_backend_name(cfg.env.transfer_backend)}"
-    run_name = f"{run_name}-{_fmt_steps(cfg.sac.total_timesteps)}"
+    if cfg.run_name is None:
+        run_name = run_slug(
+            cfg.algorithm,
+            cfg.env.env_setup,
+            cfg.env.backend or "native",
+            cfg.env.variant,
+            cfg.env.reward,
+            cfg.num_seeds,
+        )
+        if cfg.env.transfer_backend is not None:
+            run_name = f"{run_name}-to-{_backend_name(cfg.env.transfer_backend)}"
+        run_name = f"{run_name}-{_fmt_steps(cfg.sac.total_timesteps)}"
+    else:
+        run_name = cfg.run_name
     logger = SeedBufferLogger(
         num_seeds=cfg.num_seeds,
         seed_ids=tuple(range(cfg.seed, cfg.seed + cfg.num_seeds)),
@@ -182,72 +203,93 @@ def main(cfg: Config) -> None:
         tags=(cfg.study, cfg.algorithm, *cfg.wandb.tags),
     )
 
-    envelope_env = _load_envelope(cfg, cfg.env.backend)
-    env = EnvelopeGymnax(envelope_env)
-    algo = _build_algo(cfg, env)
-    for_run = make_buffered_seed_callback(
-        logger,
-        num_steps=env.default_params.max_steps_in_episode,
-        n_seeds=cfg.env.eval_n_envs,
-        kind="physics",
-        eval_rng=jax.random.PRNGKey(cfg.env.eval_seed),
-        deterministic=cfg.env.deterministic_eval,
-        extra_metrics=_sac_extra_metrics,
-    )
+    try:
+        envelope_env = _load_envelope(cfg, cfg.env.backend)
+        env = EnvelopeGymnax(envelope_env)
+        algo = _build_algo(cfg, env)
+        for_run = make_buffered_seed_callback(
+            logger,
+            num_steps=env.default_params.max_steps_in_episode,
+            n_seeds=cfg.env.eval_n_envs,
+            kind="minimal" if cfg.env.env_setup == "kstar_worldmodel" else "physics",
+            eval_rng=jax.random.PRNGKey(cfg.env.eval_seed),
+            deterministic=cfg.env.deterministic_eval,
+            extra_metrics=_sac_extra_metrics,
+        )
 
-    def train_one(rng, run_idx):
-        return algo.with_eval_callback(for_run(run_idx)).train(rng)
+        def train_one(rng, run_idx):
+            return algo.with_eval_callback(for_run(run_idx)).train(rng)
 
-    keys = seed_keys(cfg.seed, cfg.num_seeds)
-    run_indices = jnp.arange(cfg.num_seeds, dtype=jnp.int32)
-    train = jax.jit(jax.vmap(train_one))
+        keys = seed_keys(cfg.seed, cfg.num_seeds)
+        run_indices = jnp.arange(cfg.num_seeds, dtype=jnp.int32)
+        if cfg.sac.diagnose_numerics:
+            # Keep failure-only callbacks conditional; vmap evaluates both branches.
+            train = jax.jit(train_one)
+            train_args = (keys[0], run_indices[0])
+        else:
+            train = jax.jit(jax.vmap(train_one))
+            train_args = (keys, run_indices)
 
-    start = time.monotonic()
-    lowered = train.lower(keys, run_indices)
-    lower_seconds = time.monotonic() - start
-    start = time.monotonic()
-    lowered.compile()
-    compile_seconds = time.monotonic() - start
-    logger.start_time = time.time()
+        start = time.monotonic()
+        lowered = train.lower(*train_args)
+        lower_seconds = time.monotonic() - start
+        start = time.monotonic()
+        lowered.compile()
+        compile_seconds = time.monotonic() - start
+        logger.start_time = time.time()
 
-    start = time.monotonic()
-    train_states, results = train(keys, run_indices)
-    jax.block_until_ready((train_states, results))
-    jax.effects_barrier()
-    train_seconds = time.monotonic() - start
-    actual_steps = int(np.asarray(train_states.global_step[0]))
-    expected_steps = math.ceil(cfg.sac.total_timesteps / cfg.sac.eval_freq)
-    expected_steps *= math.ceil(cfg.sac.eval_freq / cfg.sac.num_envs) * cfg.sac.num_envs
-    summary: dict[str, float | str] = {
-        "time/lower_s": lower_seconds,
-        "time/compile_s": compile_seconds,
-        "time/train_s": train_seconds,
-        "run/actual_train_steps": actual_steps,
-        "run/planned_train_steps": expected_steps,
-        "run/update_to_data_ratio": cfg.sac.num_epochs / cfg.sac.num_envs,
-    }
-    if cfg.env.transfer_backend is not None:
-        transfer_summary = evaluate_transfer(
+        start = time.monotonic()
+        train_states, results = train(*train_args)
+        if cfg.sac.diagnose_numerics:
+            train_states, results = jax.tree.map(
+                lambda value: value[None], (train_states, results)
+            )
+        jax.block_until_ready((train_states, results))
+        jax.effects_barrier()
+        train_seconds = time.monotonic() - start
+        actual_steps = int(np.asarray(train_states.global_step[0]))
+        expected_steps = math.ceil(cfg.sac.total_timesteps / cfg.sac.eval_freq)
+        expected_steps *= (
+            math.ceil(cfg.sac.eval_freq / cfg.sac.num_envs) * cfg.sac.num_envs
+        )
+        summary: dict[str, float | str] = {
+            "time/lower_s": lower_seconds,
+            "time/compile_s": compile_seconds,
+            "time/train_s": train_seconds,
+            "run/actual_train_steps": actual_steps,
+            "run/planned_train_steps": expected_steps,
+            "run/update_to_data_ratio": cfg.sac.num_epochs / cfg.sac.num_envs,
+        }
+        if cfg.env.transfer_backend is not None:
+            transfer_summary = evaluate_transfer(
+                algo,
+                train_states,
+                envelope_env,
+                _load_envelope(cfg, cfg.env.transfer_backend),
+                cfg,
+                batched=True,
+            )
+            summary.update(transfer_summary)
+            write_transfer_summary(cfg.history_dir, run_name, transfer_summary)
+        checkpoints = save_run_policies(
             algo,
             train_states,
-            envelope_env,
-            _load_envelope(cfg, cfg.env.transfer_backend),
             cfg,
+            run_name,
             batched=True,
+            results=results,
+            metrics=summary,
         )
-        summary.update(transfer_summary)
-        write_transfer_summary(cfg.history_dir, run_name, transfer_summary)
-    save_run_policies(
-        algo,
-        train_states,
-        cfg,
-        run_name,
-        batched=True,
-        results=results,
-        metrics=summary,
-    )
-    logger.log_once(summary)
-    logger.finish()
+        if checkpoints:
+            artifact = wandb.Artifact(f"{run_name}-checkpoints", type="model")
+            for checkpoint in checkpoints:
+                artifact.add_file(str(checkpoint))
+                print(f"Saved checkpoint to {checkpoint}", flush=True)
+            logger.log_artifact(artifact)
+            summary["run/checkpoints_saved"] = len(checkpoints)
+        logger.log_once(summary)
+    finally:
+        logger.finish()
 
 
 if __name__ == "__main__":
