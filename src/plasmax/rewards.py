@@ -1,3 +1,12 @@
+"""TORAX rewards and their termination behavior.
+
+Registered rewards preserve their physical scores, then return squareplus on
+ordinary transitions and its logarithm on physical or solver termination.
+Invalid-state transitions return zero. Custom reward callables own their full
+return value and are not transformed by the environment.
+"""
+
+import dataclasses
 from collections.abc import Callable
 
 import jax
@@ -8,44 +17,116 @@ from torax._src.pedestal_model import (
 
 from plasmax.environment.core import EnvState
 
-RewardFn = Callable[[jax.Array, EnvState, jax.Array, EnvState], jax.Array]
+RewardFn = Callable[[EnvState, jax.Array, EnvState, jax.Array], jax.Array]
 Quantity = Callable[[EnvState], jax.Array]
 
 
-def Q_fusion(last_action, state, action, next_state):
+def _valid_input(
+    value: jax.Array, termination_code: jax.Array, *, fallback: float = 0.0
+) -> jax.Array:
+    """Mask invalid-state lanes before potentially undefined arithmetic."""
+    return jnp.where(termination_code == 4, jnp.full_like(value, fallback), value)
+
+
+def _terminal_reward(score: jax.Array, termination_code: jax.Array) -> jax.Array:
+    """Apply positive and terminal utilities without overflow or cancellation."""
+    score = _valid_input(score, termination_code)
+    half = 0.5 * score
+    radius = jnp.hypot(half, jnp.ones_like(half))
+    absolute_half = jnp.abs(half)
+    magnitude = radius + absolute_half
+    positive = jnp.where(half >= 0.0, magnitude, jnp.reciprocal(magnitude))
+    # log(squareplus(score)) == asinh(score / 2), including large negative scores.
+    # This form avoids the squared-input overflow in JAX's asinh derivative,
+    # while log1p preserves small scores whose squareplus rounds to one.
+    log_magnitude = jnp.log1p(absolute_half + (radius - 1.0))
+    terminal = jnp.where(half >= 0.0, log_magnitude, -log_magnitude)
+    reward = jnp.where(termination_code == -1, positive, terminal)
+    return jnp.where(termination_code == 4, jnp.zeros_like(reward), reward)
+
+
+def _safe_barrier_state(next_state: EnvState, termination_code: jax.Array) -> EnvState:
+    """Keep q reductions and their VJPs defined on invalid vmapped lanes."""
+    core = dataclasses.replace(
+        next_state.plasma.core,
+        q_face=_valid_input(
+            next_state.plasma.core.q_face, termination_code, fallback=1.0
+        ),
+    )
+    sim = dataclasses.replace(next_state.plasma.sim, core_profiles=core)
+    return dataclasses.replace(
+        next_state, plasma=dataclasses.replace(next_state.plasma, sim=sim)
+    )
+
+
+def Q_fusion(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+) -> jax.Array:
     """Fusion power gain (~10 at Q=10). Prone to reward hacking at low power."""
-    return next_state.plasma.Q_fusion
+    del state, action
+    return _terminal_reward(next_state.plasma.Q_fusion, termination_code)
 
 
-def beta_N(last_action, state, action, next_state):
+def beta_N(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+) -> jax.Array:
     """Normalised toroidal beta (~2)."""
-    return next_state.plasma.beta_N
+    del state, action
+    return _terminal_reward(next_state.plasma.beta_N, termination_code)
 
 
-def P_diff(last_action, state, action, next_state):
+def P_diff(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+) -> jax.Array:
     """Fusion power minus auxiliary heating power, in GW."""
-    return (next_state.plasma.P_fusion - next_state.plasma.P_aux_total) * 1e-9
+    del state, action
+    fusion = _valid_input(next_state.plasma.P_fusion, termination_code)
+    auxiliary = _valid_input(next_state.plasma.P_aux_total, termination_code)
+    return _terminal_reward((fusion - auxiliary) * 1e-9, termination_code)
 
 
-def W_thermal(last_action, state, action, next_state):
+def W_thermal(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+) -> jax.Array:
     """Thermal stored energy, in units of 100 MJ (~1 at the ITER hybrid flat-top).
 
     Unlike P_diff this has no auxiliary-heating penalty, so heating during the
     cold ramp-up pays off immediately instead of reading as pure cost."""
-    return next_state.plasma.W_thermal_total * 1e-8
+    del state, action
+    thermal = _valid_input(next_state.plasma.W_thermal_total, termination_code)
+    return _terminal_reward(thermal * 1e-8, termination_code)
 
 
 def soft_barrier(
     quantity: Quantity, limit: float, *, slope: float = 40.0, threshold: float = 0.9
 ) -> RewardFn:
-    """Soft penalty enforcing ``quantity(next_state) <= limit`` (PopDownGym-style):
+    """Raw soft penalty enforcing ``quantity(next_state) <= limit``:
     ~0 below ``threshold * limit``, increasingly negative above it. The ReLU
     floor keeps the normalized quantity nonnegative without capping penalties
     or their gradients for large violations.
     """
 
-    def reward(last_action, state, action, next_state):
-        x = jax.nn.relu(quantity(next_state) / limit)
+    def reward(
+        state: EnvState,
+        action: jax.Array,
+        next_state: EnvState,
+        termination_code: jax.Array,
+    ) -> jax.Array:
+        del state, action
+        value = _valid_input(quantity(next_state), termination_code)
+        x = jax.nn.relu(value / limit)
         return jax.nn.log_sigmoid(-slope * (x - threshold))
 
     return reward
@@ -70,7 +151,12 @@ _RAMPDOWN_BARRIERS: tuple[RewardFn, ...] = (
 )
 
 
-def rampdown(last_action, state, action, next_state):
+def rampdown(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+) -> jax.Array:
     """Keep the plasma inside stability limits while Ip is ramped down.
 
     Unlike PopDownGym — where the agent *controls* the current and the reward
@@ -78,11 +164,13 @@ def rampdown(last_action, state, action, next_state):
     prescribed by ``profile_conditions.Ip`` (a fixed schedule), not an actuator.
     So there is no current-progress term to reward: the agent can only steer the
     heating/fuelling actuators to hold the plasma safe (Greenwald / li / q_min /
-    beta_N barriers) as the current is brought down externally. Pure sum of the
-    log-sigmoid stability barriers (0 when comfortably inside every limit).
+    beta_N barriers) as the current is brought down externally. The physical
+    score sums log-sigmoid barriers and is near zero inside every limit. Its
+    positive reward is near one; termination returns the logarithm of it.
     """
-    args = (last_action, state, action, next_state)
-    return sum(b(*args) for b in _RAMPDOWN_BARRIERS)
+    next_state = _safe_barrier_state(next_state, termination_code)
+    args = (state, action, next_state, termination_code)
+    return _terminal_reward(sum(b(*args) for b in _RAMPDOWN_BARRIERS), termination_code)
 
 
 _RAMPUP_LH_BARRIERS: tuple[RewardFn, ...] = (
@@ -94,7 +182,14 @@ _RAMPUP_LH_BARRIERS: tuple[RewardFn, ...] = (
 )
 
 
-def lh_transition(last_action, state, action, next_state, *, t_final: float = 100.0):
+def lh_transition(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+    *,
+    t_final: float = 100.0,
+) -> jax.Array:
     """Stable ramp-up ending in a clean, sustained H-mode.
 
     ITER's L–H transition is timed at/after Ip flat-top, not throughout the
@@ -115,21 +210,25 @@ def lh_transition(last_action, state, action, next_state, *, t_final: float = 10
     main tuning knob: too high and the agent never approaches the margin; too
     low and it dithers.
     """
-    args = (last_action, state, action, next_state)
+    next_state = _safe_barrier_state(next_state, termination_code)
+    args = (state, action, next_state, termination_code)
     mode = next_state.plasma.mode
     Mode = pedestal_transition_state_lib.ConfinementMode
-    t_frac = next_state.plasma.t / t_final
+    t_frac = _valid_input(next_state.plasma.t, termination_code) / t_final
 
-    ratio = jax.nn.relu(next_state.plasma.P_SOL_total / next_state.plasma.P_LH)
+    p_sol = _valid_input(next_state.plasma.P_SOL_total, termination_code)
+    p_lh = _valid_input(next_state.plasma.P_LH, termination_code, fallback=1.0)
+    ratio = jax.nn.relu(p_sol / p_lh)
     h_bonus = jnp.where(mode == Mode.H_MODE, 1.0, 0.0)
     back = jnp.where(mode == Mode.TRANSITIONING_TO_L_MODE, 1.0, 0.0)
 
-    return (
+    score = (
         ratio * t_frac**2
         + h_bonus * t_frac
         - 2.0 * back
         + sum(b(*args) for b in _RAMPUP_LH_BARRIERS)
     )
+    return _terminal_reward(score, termination_code)
 
 
 _REWARD_ALIASES: dict[str, RewardFn] = {

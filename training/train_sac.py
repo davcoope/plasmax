@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 import wandb
+from jax.experimental import checkify
 
 from agents.sac import SACAdapter
 from experiments.plotting.wandb_logging import make_buffered_seed_callback
@@ -47,7 +48,6 @@ class EnvConfig:
     transfer_backend: str | None = None
     reward: str | None = None
     variant: Literal["oracle", "realistic"] = "realistic"
-    disruption_penalty: float | None = None
     eval_n_envs: int = 16
     eval_seed: int = 10_000
     deterministic_eval: bool = True
@@ -163,7 +163,6 @@ def _load_envelope(cfg: Config, backend: str | None):
             cfg.env.env_setup,
             backend,
             reward=cfg.env.reward,
-            disruption_penalty=cfg.env.disruption_penalty,
         )
     )
 
@@ -224,10 +223,12 @@ def main(cfg: Config) -> None:
         run_indices = jnp.arange(cfg.num_seeds, dtype=jnp.int32)
         if cfg.sac.diagnose_numerics:
             # Keep failure-only callbacks conditional; vmap evaluates both branches.
-            train = jax.jit(train_one)
+            train = jax.jit(checkify.checkify(train_one, errors=checkify.user_checks))
             train_args = (keys[0], run_indices[0])
         else:
-            train = jax.jit(jax.vmap(train_one))
+            train = jax.jit(
+                jax.vmap(checkify.checkify(train_one, errors=checkify.user_checks))
+            )
             train_args = (keys, run_indices)
 
         start = time.monotonic()
@@ -239,7 +240,8 @@ def main(cfg: Config) -> None:
         logger.start_time = time.time()
 
         start = time.monotonic()
-        train_states, results = train(*train_args)
+        error, (train_states, results) = train(*train_args)
+        error.throw()
         if cfg.sac.diagnose_numerics:
             train_states, results = jax.tree.map(
                 lambda value: value[None], (train_states, results)

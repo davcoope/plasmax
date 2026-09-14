@@ -35,10 +35,9 @@ class _FrozenModel(BaseModel):
 
 
 class TaskConfig(_FrozenModel):
-    """Reward and calibrated terminal penalty defining one control task."""
+    """Reward defining one control task."""
 
     reward: str
-    terminal_penalty: float | None
 
 
 class ActuatorConfig(_FrozenModel):
@@ -313,8 +312,6 @@ class PlasmaxConfig(_FrozenModel):
 
     @model_validator(mode="after")
     def _valid_actions(self) -> Self:
-        if self.task.terminal_penalty is None:
-            raise ValueError("TORAX environment terminal_penalty cannot be null")
         names = tuple(actuator.name for actuator in self.actuators)
         if len(names) != len(set(names)):
             raise ValueError("duplicate actuator names")
@@ -349,8 +346,6 @@ class WorldModelConfig(_FrozenModel):
     def _native_task(self) -> Self:
         if self.task.reward != "native":
             raise ValueError("world-model reward must be 'native'")
-        if self.task.terminal_penalty is not None:
-            raise ValueError("world models do not use a terminal penalty")
         return self
 
 

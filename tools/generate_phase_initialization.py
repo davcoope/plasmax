@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tyro
+from jax.experimental import checkify
 
 from plasmax.environment import factory as factory_lib
 from plasmax.environment.config import parse_env_and_backend
@@ -112,11 +113,12 @@ def capture(config: Config) -> ToraxInitialization | KstarInitialization:
     if config.source_steps == 0:
         return document
     parsed = parsed.model_copy(update={"state_noise": {}, "physics_randomization": {}})
-    env = factory_lib._build_env(parsed, reward=None, disruption_penalty=None)
+    env = factory_lib._build_env(parsed, reward=None)
     state, _ = env.init(jax.random.key(config.seed))
-    step = jax.jit(env.step)
+    step = jax.jit(checkify.checkify(env.step, errors=checkify.user_checks))
     for index in range(config.source_steps):
-        state, info = step(state, state.prev_action)
+        error, (state, info) = step(state, state.prev_action)
+        error.throw()
         jax.block_until_ready((state, info))
         if not bool(info.control_step_complete) or bool(
             info.terminated | info.truncated

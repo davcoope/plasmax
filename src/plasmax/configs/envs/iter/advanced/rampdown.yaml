@@ -15,7 +15,6 @@ initialization: ${DATA_DIR}/initializations/iter/advanced/hot.yaml
 
 task:
   reward: rampdown
-  terminal_penalty: -330
 
 torax:
   profile_conditions:

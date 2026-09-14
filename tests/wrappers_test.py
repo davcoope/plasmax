@@ -35,6 +35,7 @@ from helpers import (
     NOMINAL_ACTION,
     PROFILE_OBS_SPECS,
     SCALAR_OBS_SPECS,
+    checked_jit,
     make_test_config,
 )
 from helpers import make_test_env as _make_base_env
@@ -104,7 +105,7 @@ class WrapperDefaultsTest:
                 },
             }
         )
-        cls.base = _build_env(cfg, reward=None, disruption_penalty=None)
+        cls.base = _build_env(cfg, reward=None)
 
     def test_defaults_resolve_against_each_inner_layout_and_action_order(self):
         noise = NoiseWrapper(self.base)
@@ -144,7 +145,7 @@ class WrapperDefaultsTest:
         explicit = TruncationWrapper(explicit, max_steps=2)
         preset = RealisticWrappers(self.base, max_steps=2, time_aware=True)
 
-        @jax.jit
+        @checked_jit
         def transition(env, key):
             state, _ = env.init(key)
             return env.step(state, jnp.array([1, 2]))
@@ -435,7 +436,7 @@ class ObsFilterWrapperTest:
         assert info.obs.shape == (2 + N_RHO + 3 + N_RHO + N_RHO + 8,)
         assert env.obs_layout().slice_of("T_e") == slice(0, 2)
         assert env.obs_layout().slice_of("n_e") == slice(2 + N_RHO, 5 + N_RHO)
-        _, next_info = jax.jit(env.step)(state, _ACTION)
+        _, next_info = checked_jit(env.step)(state, _ACTION)
         assert next_info.obs.shape == info.obs.shape
 
 
@@ -621,7 +622,7 @@ class ObsHistoryWrapperTest:
     def test_jit_matches_eager(self):
         state, _ = self.env.init(jax.random.key(0))
         eager = self.env.step(state, _ACTION)
-        compiled = jax.jit(self.env.step)(state, _ACTION)
+        compiled = checked_jit(self.env.step)(state, _ACTION)
         chex.assert_trees_all_close(
             _with_key_data(eager), _with_key_data(compiled), rtol=1e-6, atol=1e-9
         )
@@ -780,7 +781,6 @@ class TruncationWrapperTest:
 
     def test_termination_wins_at_cutoff(self):
         base = _make_base_env(
-            disruption_penalty=7.0,
             disruption=DisruptionConfig(q_min_threshold=1e6, greenwald_threshold=1e9),
         )
         env = TruncationWrapper(base, max_steps=1)
@@ -798,7 +798,7 @@ class TruncationWrapperTest:
         # Put only lane 0 one step from the horizon; lane 1 remains at zero.
         state = state.replace(steps=jnp.array([1, 0], dtype=jnp.int32))
         actions = jnp.broadcast_to(_ACTION, (2, 2))
-        next_state, info = jax.jit(env.step)(state, actions)
+        next_state, info = checked_jit(env.step)(state, actions)
         np.testing.assert_array_equal(next_state.steps, jnp.array([2, 1]))
         np.testing.assert_array_equal(info.truncated, jnp.array([True, False]))
         np.testing.assert_array_equal(info.terminated, jnp.array([False, False]))
@@ -835,7 +835,7 @@ class CompositionTest:
         env = TruncationWrapper(env, max_steps=2)
         state, info = jax.jit(env.init)(jax.random.key(0))
         structure = jax.tree.structure(info)
-        state, next_info = jax.jit(env.step)(state, jnp.array([1, 2]))
+        state, next_info = checked_jit(env.step)(state, jnp.array([1, 2]))
         assert jax.tree.structure(next_info) == structure
         _assert_info_contract(next_info, env.observation_space.shape)
 

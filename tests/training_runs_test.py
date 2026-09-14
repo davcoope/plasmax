@@ -12,6 +12,7 @@ import pytest
 from envelope import TruncationWrapper
 from flax import struct
 from helpers import CheapBoundaryEnv
+from jax.experimental import checkify
 
 from agents.backprop import BackpropOpenLoopAgent, BackpropPolicyAgent
 from agents.mpc import MPCAgent
@@ -150,7 +151,7 @@ def test_native_host_runs_compile_log_and_save_each_seed(
         num_seeds=num_seeds,
     )
     runs.run_native(agent, config, "cheap")
-    assert ("train_one" in vmapped_functions) == (num_seeds > 1)
+    assert ("checked_fun" in vmapped_functions) == (num_seeds > 1)
     np.testing.assert_array_equal(
         sorted(tuple(key) for key in training_keys),
         [jax.random.PRNGKey(seed) for seed in range(3, 3 + num_seeds)],
@@ -197,6 +198,52 @@ def test_failed_seed_blocks_the_whole_batch_before_any_export(tmp_path, monkeypa
             "failed",
             batched=True,
         )
+    assert not list(tmp_path.iterdir())
+
+
+class NonfiniteRewardEnv(NamedEnv):
+    def step(self, state, action):
+        state, info = super().step(state, action)
+        reward = jnp.where(state.steps > 0, jnp.inf, info.reward)
+        checkify.check(jnp.isfinite(reward), "Reward must be finite")
+        return state, info.update(reward=reward)
+
+
+@pytest.mark.parametrize("num_seeds", [1, 2])
+def test_native_reward_check_blocks_export_and_finishes_tracking(
+    tmp_path, monkeypatch, tracking, num_seeds
+):
+    env = TruncationWrapper(
+        env=NonfiniteRewardEnv(obs_dim=2, action_low=(-1.0,), action_high=(1.0,)),
+        max_steps=2,
+    )
+    agent = MPCAgent.create(
+        env,
+        total_timesteps=2,
+        eval_freq=2,
+        hidden=2,
+        horizon=1,
+        num_samples=1,
+        buffer_size=2,
+        train_batch_size=1,
+        eval_num_episodes=1,
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("a reward check failure must abort before policy export")
+
+    monkeypatch.setattr(runs, "save_run_policies", unexpected)
+    with pytest.raises(checkify.JaxRuntimeError, match="Reward must be finite"):
+        runs.run_native(
+            agent,
+            RunConfig(
+                checkpoint_dir=str(tmp_path),
+                env=runs.EnvConfig(eval_n_envs=1),
+                num_seeds=num_seeds,
+            ),
+            "nonfinite",
+        )
+    assert tracking[0].finished
     assert not list(tmp_path.iterdir())
 
 
@@ -372,19 +419,17 @@ def test_rejax_seed_exports_have_scalar_progress_and_nested_configuration(
 
 
 @pytest.mark.parametrize(
-    "effective,explicit,kappa,expected",
+    "effective,explicit,expected",
     [
-        (-75.0, None, 0.75, -75.0),
-        (None, 0.0, 2.0, 0.0),
-        (None, None, 0.75, -75.0),
-        (None, None, None, -100.0),
+        ("Q_fusion", None, "Q_fusion"),
+        (None, "Q_fusion", "Q_fusion"),
+        (None, None, "lh_transition"),
     ],
 )
-def test_environment_reconstruction_preserves_penalty_and_source_clock(
+def test_environment_reconstruction_preserves_reward_and_source_clock(
     monkeypatch,
     effective,
     explicit,
-    kappa,
     expected,
 ):
     env = _env()
@@ -405,21 +450,17 @@ def test_environment_reconstruction_preserves_penalty_and_source_clock(
             "env": {
                 "env_setup": "mock/circular/smoke",
                 "backend": "mock",
-                "disruption_penalty": explicit,
-                "disruption_kappa": kappa,
+                "reward": explicit,
             }
         },
-        "source_config": {
-            "task": {"terminal_penalty": -100, "reward": "lh_transition"}
-        },
+        "source_config": {"task": {"reward": "lh_transition"}},
         "source_max_steps": 2,
     }
     if effective is not None:
-        metadata["effective_task"] = {"terminal_penalty": effective}
+        metadata["effective_task"] = {"reward": effective}
     policy = LoadedPolicy("ppo", {}, environment_interface(env), metadata, True)
     assert runs.load_policy_env(policy) is env
-    assert calls[0][1]["disruption_penalty"] == expected
-    assert calls[0][1]["reward"] == "lh_transition"
+    assert calls[0][1] == {"reward": expected}
     assert calls[1]["time_aware"] is True
     assert calls[1]["max_steps"] == 2
 

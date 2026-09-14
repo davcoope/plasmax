@@ -5,8 +5,6 @@ initialization: ${DATA_DIR}/initializations/sparc/reduced_field/hot.yaml
 
 task:
   reward: P_diff
-  # Intentionally uncalibrated; flat-top termination currently has no penalty.
-  terminal_penalty: 0.0
 torax:
   profile_conditions:
     Ip: 5.7e+6                    # constant (scalar, not time-keyed)

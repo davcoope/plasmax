@@ -19,6 +19,7 @@ import jax
 import numpy as np
 import tyro
 import wandb
+from jax.experimental import checkify
 
 from agents.policy_io import load_policy
 from training.evaluation import evaluate_policy, save_trajectories, transfer_metrics
@@ -82,7 +83,11 @@ def main(config: Config) -> None:
                     )
                     return metrics, trajectory if config.trajectories else None
 
-                return jax.jit(evaluate)(key)
+                error, result = jax.jit(
+                    checkify.checkify(evaluate, errors=checkify.user_checks)
+                )(key)
+                error.throw()
+                return result
 
             start = time.monotonic()
             metrics, source = collect(source_env)

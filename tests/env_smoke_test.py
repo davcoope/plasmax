@@ -92,7 +92,7 @@ def _assert_step_contract(env, key=None, *, single_solver_call: bool = False):
         assert int(info.internal_steps) == 1
 
     termination_code = int(info.termination_code)
-    assert termination_code in {-1, 0, 1, 2, 3}
+    assert termination_code in {-1, 0, 1, 2, 3, 4}
     assert bool(info.terminated) == (termination_code != -1)
     assert float(unwrap_to_env_state(state2).plasma.t) >= float(
         unwrap_to_env_state(state).plasma.t

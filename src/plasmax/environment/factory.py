@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import functools
-import math
-import numbers
 
 from envelope import Environment
 
@@ -24,24 +22,13 @@ def _validate_options(
     env: str,
     backend: str | None,
     reward: str | rewards_lib.RewardFn | None,
-    disruption_penalty: float | None,
 ) -> None:
     """Reject public-input errors before loading assets or constructing TORAX."""
     validate_env_backend(env, backend)
-    if disruption_penalty is not None and (
-        isinstance(disruption_penalty, bool)
-        or not isinstance(disruption_penalty, numbers.Real)
-        or not math.isfinite(float(disruption_penalty))
-    ):
-        raise ValueError("disruption_penalty must be a finite number or None")
 
     if env == "kstar_worldmodel":
         if reward is not None:
             raise ValueError("world-model environments use their native reward")
-        if disruption_penalty is not None:
-            raise ValueError(
-                "world-model environments do not support disruption_penalty"
-            )
     else:
         if reward is not None:
             rewards_lib.resolve_reward_fn(reward)
@@ -60,31 +47,13 @@ def _load_world_model_env(cfg: WorldModelConfig) -> Environment:
     )
 
 
-def _resolve_task_settings(
-    cfg: PlasmaxConfig,
-    reward: str | rewards_lib.RewardFn | None,
-    disruption_penalty: float | None,
-) -> tuple[str | rewards_lib.RewardFn, float]:
-    """Resolve omitted task settings while preserving explicit zero values."""
-    resolved_reward = cfg.task.reward if reward is None else reward
-    resolved_penalty = (
-        cfg.task.terminal_penalty if disruption_penalty is None else disruption_penalty
-    )
-    if resolved_penalty is None:
-        raise ValueError("TORAX tasks require a numeric task.terminal_penalty")
-    return resolved_reward, resolved_penalty
-
-
 def _build_env(
     cfg: PlasmaxConfig,
     *,
     reward: str | rewards_lib.RewardFn | None,
-    disruption_penalty: float | None,
 ) -> Environment:
     """Build the bare environment from a validated configuration."""
-    resolved_reward, resolved_penalty = _resolve_task_settings(
-        cfg, reward, disruption_penalty
-    )
+    resolved_reward = cfg.task.reward if reward is None else reward
     reward_fn = rewards_lib.resolve_reward_fn(resolved_reward)
     if resolved_reward == "lh_transition":
         # Ramp-up lengths differ substantially (e.g. 10 s SPARC, 60 s ITER
@@ -104,7 +73,6 @@ def _build_env(
         cfg.torax,
         actuator_specs,
         reward_fn,
-        disruption_penalty=float(resolved_penalty),
         clip_by_max_action_delta=cfg.clip_by_max_action_delta,
         disruption=cfg.disruption,
         state_noise_config=cfg.state_noise,
@@ -127,18 +95,20 @@ def make(
     backend: str | None = None,
     *,
     reward: str | rewards_lib.RewardFn | None = None,
-    disruption_penalty: float | None = None,
 ) -> Environment:
     """Build a bare environment from registry aliases.
 
     Omit ``backend`` for ``"kstar_worldmodel"``. Apply wrappers explicitly,
     for example ``RealisticWrappers(make(env, backend), max_steps=100)``.
+    A custom reward receives ``(state, action, next_state, termination_code)``
+    and returns the final scalar reward. Compiled TORAX calls must functionalize
+    reward-finiteness checks with ``checkify.checkify(..., errors=user_checks)``.
     """
-    _validate_options(env, backend, reward, disruption_penalty)
+    _validate_options(env, backend, reward)
     cfg = parse_env_and_backend(env, backend)
     if isinstance(cfg, WorldModelConfig):
         return _load_world_model_env(cfg)
-    return _build_env(cfg, reward=reward, disruption_penalty=disruption_penalty)
+    return _build_env(cfg, reward=reward)
 
 
 __all__ = ["make"]

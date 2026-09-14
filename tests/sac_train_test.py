@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from envelope import TruncationWrapper
+from helpers import checked_jit
 
 pytest.importorskip("rejax")
 
@@ -53,7 +54,7 @@ def test_short_upstream_training_returns_finite_outputs():
         normalize_rewards=False,
     ).with_eval_callback(eval_callback)
 
-    train_state, (returns, lengths) = jax.jit(algo.train)(jax.random.PRNGKey(0))
+    train_state, (returns, lengths) = checked_jit(algo.train)(jax.random.PRNGKey(0))
 
     assert returns.shape == (2, 2)
     assert lengths.shape == (2, 2)

@@ -18,13 +18,16 @@ under `experiments/`. Generic evaluation and rollout commands remain in
 
 New runs default to the `realistic` research label, which selects
 `RealisticWrappers(make(...))`; `oracle` selects `OracleWrappers`. The launchers
-inherit reward and terminal penalty from task YAML metadata unless explicitly
-overridden. Wrapper options are passed to the composition helper. Training
+inherit the reward from task YAML metadata unless explicitly overridden.
+Termination shaping belongs to the reward function. Wrapper options are passed
+to the composition helper. Training
 defaults to online W&B logging.
 
 All agents expose `train(rng) -> (state, results)` and `make_act(state)`. Backprop
 and MPC use native Envelope training; PPO/SAC use upstream Rejax. Whole training
 can be jitted and vmapped across seeds with the same static configuration.
+For multiple seeds, apply `checkify` before `vmap`: batch the checked scalar
+training function, then JIT-compile it and raise its returned errors on the host.
 TGLFNN training seeds must run as separate single-seed processes.
 
 Every training launcher saves one inference-only MessagePack policy per seed.
@@ -36,10 +39,14 @@ environment. There is no legacy checkpoint reader or training-resumption API.
 
 ```python
 import jax
+from jax.experimental import checkify
 
 from agents.policy_io import load_policy, save_policy
 
-state, results = jax.jit(agent.train)(rng)
+error, (state, results) = jax.jit(
+    checkify.checkify(agent.train, errors=checkify.user_checks)
+)(rng)
+error.throw()
 path = save_policy(agent, state, results=results, metadata=run_metadata)
 policy = load_policy(path)
 print(policy.summary())

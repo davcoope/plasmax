@@ -358,13 +358,12 @@ def save_policy(
     if getattr(env, "plasmax_config", None) is not None:
         provenance.setdefault("source_config", env.plasmax_config)
         dynamics = getattr(env.unwrapped, "_dynamics", None)
-        if hasattr(dynamics, "_disruption_penalty"):
+        if hasattr(dynamics, "_reward_fn"):
             reward = dynamics._reward_fn
             while isinstance(reward, functools.partial):
                 reward = reward.func
             provenance["effective_task"] = {
                 "reward": getattr(reward, "__name__", None),
-                "terminal_penalty": float(dynamics._disruption_penalty),
             }
     from plasmax.wrappers import find_max_steps
 

@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import wandb
+from jax.experimental import checkify
 
 from agents.policy_io import save_policy
 from plasmax import make
@@ -32,7 +33,6 @@ class EnvConfig:
     transfer_backend: str | None = None
     reward: str | None = None
     variant: Literal["oracle", "realistic"] = "realistic"
-    disruption_penalty: float | None = None
     max_steps: int | None = None
     time_aware: bool = False
     eval_n_envs: int = 16
@@ -59,7 +59,6 @@ def load_env(config: EnvConfig, backend: str | None) -> Any:
             config.env_setup,
             backend,
             reward=config.reward,
-            disruption_penalty=config.disruption_penalty,
         ),
         max_steps=config.max_steps,
         time_aware=config.time_aware,
@@ -96,15 +95,6 @@ def load_policy_env(
         wrappers = OracleWrappers
     else:
         raise ValueError(f"unknown variant {selected_variant!r}")
-    penalty = effective.get("terminal_penalty", recorded.get("disruption_penalty"))
-    # PPO's optional study multiplier is resolved when the source env is made.
-    if penalty is None and recorded.get("disruption_kappa") is not None:
-        nominal = source.get("task", {}).get("terminal_penalty")
-        if nominal is None:
-            raise ValueError("policy lacks the source penalty for disruption_kappa")
-        penalty = nominal * recorded["disruption_kappa"]
-    if penalty is None:
-        penalty = source.get("task", {}).get("terminal_penalty")
     reward = (
         recorded.get("reward")
         or effective.get("reward")
@@ -112,9 +102,9 @@ def load_policy_env(
     )
     # KSTAR's native reward is not a make() override.
     if task == "kstar_worldmodel":
-        reward = penalty = None
+        reward = None
     env = wrappers(
-        make(task, selected_backend, reward=reward, disruption_penalty=penalty),
+        make(task, selected_backend, reward=reward),
         **options,
     )
     check_interfaces(policy, env)
@@ -215,7 +205,10 @@ def evaluate_transfer(
 
     state_batch = states if batched else jax.tree.map(lambda x: x[None], states)
     start = time.monotonic()
-    outputs = jax.jit(jax.vmap(evaluate_one))(state_batch)
+    error, outputs = jax.jit(
+        jax.vmap(checkify.checkify(evaluate_one, errors=checkify.user_checks))
+    )(state_batch)
+    error.throw()
     jax.block_until_ready(outputs)
     elapsed = time.monotonic() - start
     return transfer_metrics(
@@ -277,10 +270,12 @@ def run_native(agent: Any, config: Any, run_name: str) -> None:
         indices = jnp.arange(config.num_seeds, dtype=jnp.int32)
         if config.num_seeds == 1:
             # Keep each independent run's outer control flow unbatched.
-            train = jax.jit(train_one)
+            train = jax.jit(checkify.checkify(train_one, errors=checkify.user_checks))
             train_args = (keys[0], indices[0])
         else:
-            train = jax.jit(jax.vmap(train_one))
+            train = jax.jit(
+                jax.vmap(checkify.checkify(train_one, errors=checkify.user_checks))
+            )
             train_args = (keys, indices)
         start = time.monotonic()
         lowered = train.lower(*train_args)
@@ -292,7 +287,8 @@ def run_native(agent: Any, config: Any, run_name: str) -> None:
         start = time.monotonic()
         # Reuse JIT's cache: direct Compiled calls mishandle TORAX closure
         # constants on the current JAX version (also see train_ppo).
-        states, results = train(*train_args)
+        error, (states, results) = train(*train_args)
+        error.throw()
         if config.num_seeds == 1:
             states, results = jax.tree.map(lambda value: value[None], (states, results))
         jax.block_until_ready((states, results))

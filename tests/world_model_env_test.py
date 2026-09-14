@@ -388,7 +388,6 @@ class KstarLoaderTest:
         "kwargs, message",
         [
             ({"reward": "P_diff"}, "native reward"),
-            ({"disruption_penalty": -1.0}, "disruption_penalty"),
             ({"backend": "qlknn"}, "standalone"),
         ],
     )

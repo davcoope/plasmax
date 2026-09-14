@@ -16,7 +16,6 @@ initialization: ${DATA_DIR}/initializations/kstar/nominal.yaml
 
 task:
   reward: native
-  terminal_penalty: null
 
 world_model:
   name: kstar_lstm

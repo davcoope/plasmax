@@ -254,6 +254,7 @@ def _termination_metrics(traj, episode_returns, episode_lengths) -> dict:
             "termination/q_min_disruption_rate": rate(1),
             "termination/greenwald_disruption_rate": rate(2),
             "termination/solver_failure_rate": rate(3),
+            "termination/invalid_state_rate": rate(4),
         }
     )
     return metrics

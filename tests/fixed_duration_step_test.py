@@ -1,6 +1,7 @@
 """Unit tests for bounded differentiable physical control steps."""
 
 import dataclasses
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -155,6 +156,7 @@ class FixedDurationPrimalTest:
         assert int(result.sawtooth_crashes) == 0
         assert bool(result.control_step_complete)
         assert not bool(result.step_limit_reached)
+        assert not bool(result.invalid_state)
 
     def test_shortened_substeps_sum_to_exact_interval(self):
         result = _run(_provider([0.04, 0.03, 0.03]))
@@ -186,6 +188,7 @@ class FixedDurationPrimalTest:
         assert int(result.sim_state.solver_numeric_outputs.solver_error_state) == 1
         assert not bool(result.control_step_complete)
         assert not bool(result.step_limit_reached)
+        assert not bool(result.invalid_state)
 
     @pytest.mark.parametrize("invalid_dt", [0.0, -0.01, np.nan])
     def test_invalid_or_nonpositive_dt_fails_without_elapsed_time(self, invalid_dt):
@@ -230,6 +233,7 @@ class FixedDurationPrimalTest:
         assert not bool(result.control_step_complete)
         assert bool(result.step_limit_reached)
         assert int(result.sim_state.solver_numeric_outputs.solver_error_state) == 1
+        assert not bool(result.invalid_state)
 
     def test_sawtooth_event_is_followed_by_remaining_pde_step(self):
         provider = _provider([0.01, 1.0], sawtooth_events=[True, False])
@@ -256,6 +260,68 @@ class FixedDurationPrimalTest:
 
 
 class FixedDurationTransformTest:
+    @pytest.mark.parametrize("invalid_post", [np.nan, np.inf, -np.inf])
+    def test_invalid_internal_step_stops_scan_and_while_under_jit_vmap(
+        self, invalid_post
+    ):
+        def step_with_failure(state, post, max_dt, inputs):
+            provider, failure_step, bad_value = inputs
+            next_state, _ = _synthetic_step(state, post, max_dt, provider)
+            # The source would recover on its next call. The stepper must still
+            # retain the first invalid transition and never reach that call.
+            next_post = jnp.where(
+                next_state.calls == failure_step,
+                bad_value,
+                next_state.value * next_state.dt,
+            )
+            return next_state, next_post
+
+        def run_one(stepper, failure_step):
+            return stepper(
+                step_with_failure,
+                _state_is_finite,
+                8,
+                0,
+                jnp.asarray(0.1, dtype=jnp.float64),
+                _initial_state(),
+                jnp.asarray(0.0, dtype=jnp.float64),
+                (
+                    _provider([0.04, 0.03, 0.03]),
+                    failure_step,
+                    jnp.asarray(invalid_post, dtype=jnp.float64),
+                ),
+            )
+
+        # Failure can occur on the first, middle, or final required substep;
+        # zero leaves one independently completing environment in the batch.
+        failure_steps = jnp.asarray([1, 2, 3, 0], dtype=jnp.int32)
+        results = []
+        for stepper in (fixed_duration_step, _fixed_duration_step_scan):
+            result = jax.jit(jax.vmap(partial(run_one, stepper)))(failure_steps)
+            np.testing.assert_array_equal(result.internal_steps, [1, 2, 3, 3])
+            np.testing.assert_array_equal(result.sim_state.calls, [1, 2, 3, 3])
+            np.testing.assert_allclose(
+                result.sim_state.t, [0.04, 0.07, 0.1, 0.1], atol=1e-12, rtol=0.0
+            )
+            np.testing.assert_array_equal(
+                result.invalid_state, [True, True, True, False]
+            )
+            np.testing.assert_array_equal(
+                result.control_step_complete, [False, False, False, True]
+            )
+            np.testing.assert_array_equal(result.step_limit_reached, False)
+            np.testing.assert_array_equal(
+                result.post_processed_outputs[:3], invalid_post
+            )
+            results.append(result)
+
+        for while_leaf, scan_leaf in zip(
+            jax.tree.leaves(results[0]), jax.tree.leaves(results[1]), strict=True
+        ):
+            np.testing.assert_allclose(
+                while_leaf, scan_leaf, atol=1e-12, rtol=0.0, equal_nan=True
+            )
+
     @staticmethod
     def _objective(initial_value, gain):
         provider = _provider([0.04, 0.03, 0.03], gain=gain)

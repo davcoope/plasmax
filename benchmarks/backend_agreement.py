@@ -27,6 +27,7 @@ from typing import Any, Literal
 import jax
 import numpy as np
 import tyro
+from jax.experimental import checkify
 
 from plasmax.environment.factory import make
 from plasmax.wrappers import PhysicsRandomizationWrapper, unwrap_to_env_state
@@ -102,7 +103,6 @@ def _validate_solver_error_states(error_states: np.ndarray) -> None:
 def _make_rollout_runner(env: Any, n_steps: int) -> RolloutRunner:
     """Build one compiled rollout callable that can be reused across seeds."""
 
-    @jax.jit
     def run(key: jax.Array):
         state, _ = env.init(key)
         action = unwrap_to_env_state(state).prev_action
@@ -124,7 +124,14 @@ def _make_rollout_runner(env: Any, n_steps: int) -> RolloutRunner:
         _, outputs = jax.lax.scan(_step, state, xs=None, length=n_steps)
         return outputs
 
-    return run
+    checked_run = jax.jit(checkify.checkify(run, errors=checkify.user_checks))
+
+    def run_checked(key: jax.Array):
+        error, outputs = checked_run(key)
+        error.throw()
+        return outputs
+
+    return run_checked
 
 
 def _collect_rollout(

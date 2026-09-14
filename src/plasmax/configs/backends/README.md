@@ -85,8 +85,14 @@ Both limits are static and changing either recompiles the JAX transition.
 
 Transition info exposes `internal_steps`, `sawtooth_crashes`,
 `control_step_complete`, and `step_limit_reached`. Exhaustion or a failed solve
-terminates with code `3` at its actual partial time; a successful transition
-lands exactly on the configured control grid.
+with otherwise finite values terminates with code `3` at its actual partial
+time; a successful transition lands exactly on the configured control grid.
+After each internal step, NaN or infinity in checked profiles or critical
+outputs (including `P_cyclotron_e`, `P_SOL_total`, and `P_LH`) stops advancement
+with code `4` (`INVALID_STATE`). Nonfinite observations or the checked
+Greenwald value also produce code `4`, which takes precedence over code `3` and
+physical disruption codes. Built-in rewards return zero for invalid states.
+A nonfinite final float32 reward instead raises `Reward must be finite`.
 
 All solvers use **Pereverzev–Corrigan artificial diffusion**
 (`use_pereverzev`, `chi_pereverzev`, `D_pereverzev`): a large artificial

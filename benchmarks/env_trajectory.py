@@ -37,6 +37,7 @@ from typing import Annotated, Any, Literal
 import jax
 import jax.numpy as jnp
 import tyro
+from jax.experimental import checkify
 
 import plasmax
 from plasmax.environment.merge import valid_env_backend_combos
@@ -299,12 +300,19 @@ def _run_to_boundary(environment: Any) -> tuple[Any, jax.Array]:
         carry = jax.lax.cond(carry[2], step, lambda frozen: frozen, carry)
         return carry, None
 
-    final, _ = jax.lax.scan(
-        scan_step,
-        (state, info, active, steps),
-        None,
-        length=environment.max_steps,
+    def run(carry):
+        final, _ = jax.lax.scan(
+            scan_step,
+            carry,
+            None,
+            length=environment.max_steps,
+        )
+        return final
+
+    error, final = checkify.checkify(run, errors=checkify.user_checks)(
+        (state, info, active, steps)
     )
+    error.throw()
     jax.block_until_ready(final)
     _, info, _, steps = final
     return info, steps

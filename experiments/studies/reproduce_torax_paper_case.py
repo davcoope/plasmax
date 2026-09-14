@@ -126,7 +126,7 @@ def _paper_scenario(geometry_directory: Path, t_final: float, dt: float):
     return PlasmaxConfig(
         environment_key="torax_paper_iter_stationary",
         torax=torax_config,
-        task=TaskConfig(reward="P_diff", terminal_penalty=0.0),
+        task=TaskConfig(reward="P_diff"),
         actuators=[
             ActuatorConfig(
                 name="P_nbi",
@@ -164,7 +164,7 @@ def _build_env(t_final: float, dt: float):
     scenario = _paper_scenario(geometry_directory, t_final, dt)
     num_steps = int(round(t_final / dt))
     return OracleWrappers(
-        env_config._build_env(scenario, reward="P_diff", disruption_penalty=0.0),
+        env_config._build_env(scenario, reward="P_diff"),
         max_steps=num_steps,
         time_aware=False,
     )

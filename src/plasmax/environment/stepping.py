@@ -20,8 +20,8 @@ class FixedDurationStepResult:
 
     ``internal_steps`` counts every TORAX call, while ``sawtooth_crashes``
     counts the event-only calls within that total. A transition is successful
-    only when the complete requested duration was reached without a solver or
-    budget failure.
+    only when the complete requested duration was reached without a solver,
+    invalid-state, or budget failure.
     """
 
     sim_state: Any
@@ -30,6 +30,7 @@ class FixedDurationStepResult:
     sawtooth_crashes: jax.Array
     control_step_complete: jax.Array
     step_limit_reached: jax.Array
+    invalid_state: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -48,6 +49,7 @@ class _FixedDurationCarry:
     saw_coarse_convergence: jax.Array
     failed: jax.Array
     step_limit_reached: jax.Array
+    invalid_state: jax.Array
 
 
 def _fixed_duration_should_continue(carry: _FixedDurationCarry) -> jax.Array:
@@ -122,6 +124,7 @@ def _fixed_duration_body(
         ),
         failed=carry.failed | solver_failed | ~valid_dt | ~finite_state,
         step_limit_reached=step_limit_reached,
+        invalid_state=carry.invalid_state | ~finite_state,
     )
 
 
@@ -145,6 +148,7 @@ def _initial_fixed_duration_carry(
         saw_coarse_convergence=jnp.asarray(False),
         failed=invalid_control_dt,
         step_limit_reached=jnp.asarray(False),
+        invalid_state=jnp.asarray(False),
     )
 
 
@@ -197,6 +201,7 @@ def _finalize_fixed_duration_step(
         sawtooth_crashes=carry.event_substeps,
         control_step_complete=complete,
         step_limit_reached=carry.step_limit_reached,
+        invalid_state=carry.invalid_state,
     )
 
 

@@ -8,7 +8,7 @@ import jax
 import numpy as np
 import pytest
 import yaml
-from helpers import make_test_config, make_test_env
+from helpers import checked_jit, make_test_config, make_test_env
 
 from plasmax import make
 from plasmax.environment.config import parse_env_and_backend
@@ -394,7 +394,7 @@ def test_packaged_snapshot_rebuilds_two_backends_and_jits_first_steps() -> None:
         state = env._dynamics._initial_env_state
         assert float(state.plasma.t) == 0.0
         assert env.safe_max_steps == 4400
-        next_state, info = jax.jit(env.step)(state, state.prev_action)
+        next_state, info = checked_jit(env.step)(state, state.prev_action)
         jax.block_until_ready((next_state, info))
         assert bool(info.control_step_complete)
         states[backend] = state

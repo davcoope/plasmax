@@ -138,18 +138,27 @@ JIT/eager parity.
 
 ## Configuration and task metadata
 
-Every leaf task YAML must specify `task.reward` and `task.terminal_penalty`.
+Every leaf task YAML must specify `task.reward`.
 Tests cover:
 
 - the phase-appropriate reward for every leaf task;
-- all ten calibrated ITER/SPARC ramp penalties exactly;
-- explicit `0.0` penalties for flat-top, STEP, and the mock smoke fixture;
-- KSTAR's native reward and null terminal penalty;
-- loader inheritance when reward and penalty are omitted;
+- KSTAR's unchanged native reward;
+- loader inheritance when reward is omitted;
 - string and callable reward overrides;
-- explicit zero overriding nonzero task metadata;
+- stable built-in squareplus for ordinary transitions and its logarithm for
+  disruption or solver failure, including gradients for large negative scores;
+- zero value and reward-branch gradient for invalid-state built-in rewards;
+- custom rewards receiving `(state, action, next_state, termination_code)` and
+  returning the final reward without an environment transformation;
+- explicit finiteness errors after the float32 reward cast;
 - bare construction plus explicit realistic/oracle composition;
 - wrapper default resolution and persistent physics updates/reset behavior.
+
+Compiled TORAX tests use explicit `checkify.user_checks` around the outer tested
+function. The `checked_jit` helper in `tests/helpers.py` propagates errors with
+`checkify.check_error`; host callers inspect errors with `err.throw()`. Keep
+eager, JIT, vmap, scan, and gradient contracts covered without enabling automatic
+NaN checks inside simulator arithmetic.
 
 Initialization tests cover all task references from an unrelated working
 directory, typed YAML loading, numeric/scientific notation, stable serialization,
