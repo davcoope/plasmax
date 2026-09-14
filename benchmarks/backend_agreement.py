@@ -102,6 +102,7 @@ def _validate_solver_error_states(error_states: np.ndarray) -> None:
 def _make_rollout_runner(env: Any, n_steps: int) -> RolloutRunner:
     """Build one compiled rollout callable that can be reused across seeds."""
 
+    @jax.jit
     def run(key: jax.Array):
         state, _ = env.init(key)
         action = unwrap_to_env_state(state).prev_action
@@ -123,7 +124,7 @@ def _make_rollout_runner(env: Any, n_steps: int) -> RolloutRunner:
         _, outputs = jax.lax.scan(_step, state, xs=None, length=n_steps)
         return outputs
 
-    return jax.jit(run)
+    return run
 
 
 def _collect_rollout(

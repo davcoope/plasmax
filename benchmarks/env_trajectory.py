@@ -299,16 +299,12 @@ def _run_to_boundary(environment: Any) -> tuple[Any, jax.Array]:
         carry = jax.lax.cond(carry[2], step, lambda frozen: frozen, carry)
         return carry, None
 
-    def run(carry):
-        final, _ = jax.lax.scan(
-            scan_step,
-            carry,
-            None,
-            length=environment.max_steps,
-        )
-        return final
-
-    final = run((state, info, active, steps))
+    final, _ = jax.lax.scan(
+        scan_step,
+        (state, info, active, steps),
+        None,
+        length=environment.max_steps,
+    )
     jax.block_until_ready(final)
     _, info, _, steps = final
     return info, steps

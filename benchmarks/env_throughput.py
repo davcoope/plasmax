@@ -21,6 +21,7 @@ import platform
 import statistics
 import time
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import jax
@@ -108,12 +109,9 @@ def _make_run(
         return _rollout(env, key, n_steps, reset_on_boundary)
 
     scalar = n_envs == 1 and not vmap_scalar
-    compiled_run = jax.jit(rollout if scalar else jax.vmap(rollout))
-
-    def run():
-        return compiled_run(keys[0] if scalar else keys)
-
-    return run
+    return partial(
+        jax.jit(rollout if scalar else jax.vmap(rollout)), keys[0] if scalar else keys
+    )
 
 
 def _time_run(env: Any, cfg: Config, n_envs: int) -> Timing:

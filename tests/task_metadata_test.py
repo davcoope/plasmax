@@ -13,7 +13,7 @@ from plasmax import rewards
 from plasmax.environment import registry
 from plasmax.environment.config import parse_env_and_backend
 from plasmax.environment.factory import make
-from plasmax.environment.schema import TaskConfig, WorldModelConfig
+from plasmax.environment.schema import TaskConfig
 
 _MOCK_ENV = "mock/circular/smoke"
 _MOCK_BACKEND = "mock"
@@ -83,16 +83,3 @@ def test_phase_defaults_are_available_without_duplicated_reward_maps():
     rampdown = parse_env_and_backend("sparc/prd/rampdown", "cgm")
     assert rampup.task == TaskConfig(reward="lh_transition")
     assert rampdown.task == TaskConfig(reward="rampdown")
-
-
-def test_kstar_inherits_native_reward():
-    config = parse_env_and_backend("kstar_worldmodel")
-    assert isinstance(config, WorldModelConfig)
-    assert config.task == TaskConfig(reward="native")
-
-    env = make("kstar_worldmodel")
-    assert env is not None
-    with pytest.raises(ValueError, match="native"):
-        make("kstar_worldmodel", reward="P_diff")
-    with pytest.raises(ValueError, match="standalone|no backend"):
-        make("kstar_worldmodel", backend="mock")

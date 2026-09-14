@@ -28,6 +28,7 @@ import platform
 import statistics
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -150,12 +151,7 @@ def _make_backward_pass(
             finite,
         )
 
-    compiled_backward = jax.jit(backward)
-
-    def run():
-        return compiled_backward(theta, keys)
-
-    return run
+    return partial(jax.jit(backward), theta, keys)
 
 
 def _peak_bytes_in_use() -> int | None:

@@ -29,6 +29,7 @@ def _snapshot(state):
 def _collect_backend(backend: str) -> dict[str, object]:
     env = PhysicsRandomizationWrapper(make("iter/hybrid/flattop", backend))
 
+    @jax.jit
     def rollout(key: jax.Array):
         state, _ = env.init(key)
         action = unwrap_to_env_state(state).prev_action
@@ -50,7 +51,7 @@ def _collect_backend(backend: str) -> dict[str, object]:
         )
         return initial, snapshots, complete, terminated
 
-    initial, snapshots, complete, terminated = jax.jit(rollout)(jax.random.key(0))
+    initial, snapshots, complete, terminated = rollout(jax.random.key(0))
     jax.block_until_ready((initial, snapshots, complete, terminated))
     complete_np = np.asarray(complete)
     terminated_np = np.asarray(terminated)

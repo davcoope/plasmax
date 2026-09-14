@@ -97,17 +97,8 @@ task:
   reward: lh_transition
 ```
 
-Omitting `reward` uses the task metadata. Ramp-up tasks use `lh_transition`,
-flat-top and STEP tasks use `P_diff`, and ramp-down tasks use `rampdown`. KSTAR
-keeps its native learned-model reward unchanged.
-
-Built-in TORAX rewards retain their physical objectives and soft safety barriers.
-For an ordinary transition, they return the positive squareplus of the objective
-score, `(score + sqrt(score**2 + 4)) / 2`, evaluated in a numerically stable form.
-For disruption or solver failure, they return its logarithm, computed as
-`asinh(score / 2)` to preserve gradients for large negative scores. Invalid states
-return zero with zero gradient through the reward branch. Initialization, reset,
-and rollout-padding rewards remain zero.
+Omitting `reward` uses the task default; built-in TORAX rewards apply squareplus
+normally, its logarithm on disruption or solver failure, and zero on invalid state.
 
 ```python
 env = RealisticWrappers(plasmax.make("iter/advanced/rampup", backend="qlknn"))
@@ -120,11 +111,6 @@ oracle_ablation = OracleWrappers(
     )
 )
 ```
-
-Custom reward functions receive `(state, action, next_state, termination_code)`
-and own the complete reward, including terminal behavior. The environment casts
-their result to float32 and checks that it is finite; it adds no transformation.
-The previous action is available as `state.prev_action`.
 
 Individual wrappers also resolve their defaults from `env.plasmax_config` and
 accept their existing explicit arguments for custom compositions:
@@ -155,24 +141,6 @@ wrapper owns its RNG; `init(key)` and `reset(state, key)` seed these streams.
 - `info.termination_code`: the environment's termination reason.
 
 If termination and the time limit coincide, termination wins.
-
-TORAX termination codes are `1` for a q-min disruption, `2` for exceeding the
-configured Greenwald limit, `3` for solver failure or internal-step budget
-exhaustion, and `4` (`INVALID_STATE`) for NaN or infinity in checked profiles,
-critical derived outputs, observations, or the checked Greenwald value. When
-multiple conditions hold, priority is
-`4 → 3 → 1 → 2`. Invalid states end the transition immediately; finite negative
-derived values remain allowed. Rewards are cast to float32 without a finiteness
-assertion or a change to the termination code. Evaluation logging reports
-`evaluation/nonfinite_reward_rate` over valid transitions; rollout padding is
-excluded. Nonfinite rewards are not replaced or filtered from returns.
-
-Environment steps can be compiled directly:
-
-```python
-step = jax.jit(env.step)
-state, info = step(state, action)
-```
 
 Fixed-shape rollout collection is part of the installed library:
 
