@@ -5,28 +5,6 @@ that tracks running per-sensor mean/variance (Welford) of every observation
 the agent receives - measuring natural variation under a real, learning
 policy, unlike the zero/random-action proxies in
 ``experiments/studies/signal_to_noise_ratio``.
-
-Buckets one per eval checkpoint (ceil(total_timesteps / eval_freq)), so
-train bucket i and eval checkpoint i cover the same training window.
-Training and eval stay separate automatically: rejax's evaluator builds
-and discards its own env states via ``env.reset``, never touching the
-training accumulator.
-
-Statistics use the *degraded* observation space (what the policy actually
-sees), not the full-resolution space NoiseWrapper operates on. Run with
-``--env.noise-multiplier 0.0`` to measure natural variation uncontaminated
-by injected noise.
-
-Logs through the same ``SeedBufferLogger`` as ``train_ppo.py``, so progress
-and ``evaluation/*``/``train/*`` metrics look identical, with per-sensor
-tables printed live at each checkpoint (seed-averaged) and a final TOTAL
-table over the whole run.
-
-Run:
-    uv run python training/obs_stats_training.py \\
-        --env.noise-multiplier 0.0 \\
-        --ppo.total-timesteps 5120000 --ppo.eval-freq 512000 \\
-        --num-seeds 3
 """
 
 from __future__ import annotations
@@ -78,16 +56,12 @@ class ObsStatsState(WrappedState):
 class ObsStatsWrapper(Wrapper):
     """Accumulate per-sensor mean/variance of emitted observations.
 
-    Each vmapped environment instance keeps its own accumulator, bucketed by
-    that instance's own step count so bucket ``i`` covers exactly the same
-    training window as eval checkpoint ``i`` - the same span of steps that
-    fed into the policy being evaluated at that checkpoint. Accumulators
-    are carried through ``reset`` - an episode ending must not discard the
-    statistics gathered so far.
+    Stats are calculated separately for each environment. ``init`` starts the
+    accumulators at zero. ``reset`` is called when an episode ends and a new
+    one begins - it ensures that auto-reset does not wipe stats.
 
-    ``m2`` is the sum of squared deviations from the running mean (Welford),
-    which is numerically stable over millions of updates and can be merged
-    across instances exactly. Variance is ``m2 / count``.
+    ``m2`` is the sum of squared deviations from the running mean (Welford).
+    Variance is ``m2 / count``.
     """
 
     bucket_size: int = static_field(default=1)
@@ -136,8 +110,6 @@ class ObsStatsWrapper(Wrapper):
         # A solver-failure disruption (core.py's termination_code=3) can
         # return a non-finite obs; core.py guards reward against this same
         # case (`reward = jnp.where(disruption, ...)`), but not obs itself.
-        # A finite disruption boundary (q_min/Greenwald) is real, policy-
-        # relevant data and stays in; only non-finite steps are skipped.
         valid = jnp.all(jnp.isfinite(info.obs))
         bucket = jnp.minimum(state.step // self.bucket_size, self.n_buckets - 1)
 
@@ -182,25 +154,10 @@ def _find_stats_state(tree) -> ObsStatsState:
 def _merge(count, mean, m2, axis):
     """Chan's parallel merge of Welford accumulators along ``axis``.
 
-    Shapes are ``(..., N, ...)`` with ``N`` the axis being reduced. Buckets
+    Shapes are ``(..., N, ...)`` with ``N`` the axis being reduced. Entries
     with zero samples contribute nothing and are guarded against division by
     zero.
     """
-    total = np.sum(count, axis=axis)
-    safe = np.where(total == 0.0, 1.0, total)
-    merged_mean = np.sum(count * mean, axis=axis) / safe
-    spread = (mean - np.expand_dims(merged_mean, axis)) ** 2
-    merged_m2 = np.sum(m2 + count * spread, axis=axis)
-    return total, merged_mean, merged_m2
-
-
-def _std(count, m2):
-    safe = np.where(count == 0.0, 1.0, count)
-    return np.sqrt(np.maximum(m2 / safe, 0.0))
-
-
-def _merge_jax(count, mean, m2, axis):
-    """In-trace equivalent of :func:`_merge`, for use inside the callback."""
     total = jnp.sum(count, axis=axis)
     safe = jnp.where(total == 0.0, 1.0, total)
     merged_mean = jnp.sum(count * mean, axis=axis) / safe
@@ -210,26 +167,36 @@ def _merge_jax(count, mean, m2, axis):
 
 
 def _obs_metrics(prefix, layout, names, noise_cfg, count, mean, m2):
-    """Flat ``{metric_name: scalar}`` dict for one bucket's statistics.
+    """Flat ``{metric_name: scalar}`` dict of one seed's bucket statistics.
 
     ``count``/``mean``/``m2`` are per-observation-channel arrays of shape
     ``(obs_dim,)``. Channels belonging to one sensor are merged so each
-    sensor contributes a single mean/std, matching the end-of-run tables.
+    sensor contributes a single rms/std/snr.
+
+    ``NoiseWrapper`` draws ``noise_t = rel_std * eps_t * obs_t`` with
+    ``eps_t`` zero-mean, unit-variance and independent of ``obs_t``, so
+    ``std(noise) = rel_std * sqrt(E[obs^2]) = rel_std * RMS(obs)`` - the
+    mean alone understates it. Pooled over a sensor's channels,
+    ``RMS^2 = mean^2 + std^2``.
+
+    SNR is kept as signal-over-noise and its reciprocal is never formed:
+    since ``1/x`` is convex, averaging ``noise_std / obs_std`` across seeds
+    would exceed the reciprocal of the averaged SNR (Jensen's inequality),
+    overstating noise dominance whenever seeds disagree.
     """
     metrics = {}
     for name in names:
         sl = layout.slice_of(name)
-        total, _, sensor_m2 = _merge_jax(count[sl], mean[sl], m2[sl], axis=0)
+        total, sensor_mean, sensor_m2 = _merge(count[sl], mean[sl], m2[sl], axis=0)
         safe = jnp.where(total == 0.0, 1.0, total)
         obs_std = jnp.sqrt(jnp.maximum(sensor_m2 / safe, 0.0))
-        abs_mean = jnp.mean(jnp.abs(mean[sl]))
-        noise_std = float(noise_cfg.get(name, 0.0)) * abs_mean
-        metrics[f"{prefix}/{name}/obs_abs_mean"] = abs_mean
+        obs_rms = jnp.sqrt(sensor_mean**2 + obs_std**2)
+        noise_std = float(noise_cfg.get(name, 0.0)) * obs_rms
+        metrics[f"{prefix}/{name}/obs_rms"] = obs_rms
         metrics[f"{prefix}/{name}/obs_std"] = obs_std
         metrics[f"{prefix}/{name}/noise_std_at_1x"] = noise_std
-        metrics[f"{prefix}/{name}/noise_to_signal"] = jnp.where(
-            obs_std > 0.0, noise_std / jnp.where(obs_std > 0.0, obs_std, 1.0), jnp.nan
-        )
+        # Infinite for a sensor with no wrappers.yaml noise entry (``t``).
+        metrics[f"{prefix}/{name}/snr"] = obs_std / noise_std
     return metrics
 
 
@@ -321,9 +288,10 @@ def _make_logging_callback(
     (``obs_train/*``, read out of ``ts.env_state``) and for this checkpoint's
     own eval rollouts (``obs_eval/*``, computed from the eval trajectory).
     Routing through ``logger.log`` via ``jax.debug.callback`` means it
-    appears live during training rather than only at the end. The tables
-    themselves are printed by :class:`_TableLogger` at flush time, so they
-    are seed-averaged and stay ordered with the ``step=`` progress line.
+    appears live during training rather than only at the end. Each seed
+    reports its own statistics; :class:`_TableLogger` combines them across
+    seeds at flush time, which also keeps each table ordered with its
+    ``step=`` progress line.
     """
 
     def for_run(run_idx):
@@ -345,7 +313,7 @@ def _make_logging_callback(
             stats = _find_stats_state(ts.env_state)
             # (num_envs, n_buckets[, obs_dim]) -> merge over envs.
             count = stats.count[..., None] * jnp.ones_like(stats.mean)
-            train_count, train_mean, train_m2 = _merge_jax(
+            train_count, train_mean, train_m2 = _merge(
                 count, stats.mean, stats.m2, axis=0
             )
             # Buckets fill in order, so the one just closed is step//size - 1.
@@ -396,40 +364,14 @@ def _make_logging_callback(
 # ---------------------------------------------------------------------------
 
 
-def _sensor_rows(layout, names, noise_cfg, count, mean, m2):
-    """Per-sensor aggregate over each sensor's slice of the obs vector."""
-    rows = []
-    for name in names:
-        sl = layout.slice_of(name)
-        # Pool the sensor's channels: identical counts, so a plain merge
-        # across the slice gives the sensor-level mean/std.
-        c_slice = np.broadcast_to(count, mean.shape)[sl]
-        total, _, sensor_m2 = _merge(c_slice, mean[sl], m2[sl], axis=0)
-        sensor_std = float(_std(total, sensor_m2))
-        abs_mean = float(np.mean(np.abs(mean[sl])))
-        rel_std = float(noise_cfg.get(name, 0.0))
-        noise_std = rel_std * abs_mean
-        ratio = noise_std / sensor_std if sensor_std > 0 else float("nan")
-        rows.append(
-            {
-                "sensor": name,
-                "noise_rel_std": rel_std,
-                "obs_abs_mean": abs_mean,
-                "obs_std": sensor_std,
-                "noise_std_at_1x": noise_std,
-                "noise_to_signal": ratio,
-            }
-        )
-    return rows
-
-
 _HEADERS = (
     ("sensor", "<18", "s"),
     ("noise_rel_std", ">14", ".3f"),
-    ("obs_abs_mean", ">14", ".4g"),
+    ("obs_rms", ">12", ".4g"),
     ("obs_std", ">12", ".4g"),
     ("noise_std_at_1x", ">16", ".4g"),
-    ("noise_to_signal", ">16", ".3f"),
+    ("snr_mean", ">12", ".3f"),
+    ("snr_std", ">12", ".3f"),
 )
 
 
@@ -448,34 +390,50 @@ def _print_table(title: str, rows) -> None:
 class _TableLogger(SeedBufferLogger):
     """SeedBufferLogger that also prints per-sensor tables at flush time.
 
-    The observation statistics already travel in the metrics dict, so the
-    tables are rebuilt from the seed-averaged values rather than printed
-    per-seed. Printing here (rather than from a separate debug callback)
-    keeps each table adjacent to its own ``step=`` progress line instead of
-    racing it - ``jax.debug.callback`` ordering across a vmapped seed axis
-    is not guaranteed.
+    Each seed is an independently trained policy, so its SNR is computed in
+    full before any cross-seed aggregation, and the table reports the mean
+    and spread of those per-seed SNRs - as ``return`` is reported, rather
+    than pooled as if the seeds were one population. The descriptive
+    columns beside it are plain seed means, so ``obs_std / noise_std`` as
+    printed will not exactly reproduce ``snr_mean``.
+
+    Printing here (rather than from a separate debug callback) keeps each
+    table adjacent to its own ``step=`` progress line instead of racing it -
+    ``jax.debug.callback`` ordering across a vmapped seed axis is not
+    guaranteed.
     """
 
-    def __init__(self, *args, layout, names, noise_cfg, **kwargs):
+    def __init__(self, *args, names, noise_cfg, **kwargs):
         super().__init__(*args, **kwargs)
-        self._layout = layout
         self._names = names
         self._noise_cfg = noise_cfg
 
-    def _rows_from_metrics(self, prefix, mean):
+    def _rows(self, prefix, per_seed):
+        order = sorted(per_seed)
+
+        def seed_values(key):
+            return np.asarray([per_seed[r][key] for r in order], dtype=np.float64)
+
         rows = []
         for name in self._names:
             key = f"{prefix}/{name}"
-            if f"{key}/obs_std" not in mean:
+            if f"{key}/snr" not in per_seed[order[0]]:
                 return None
+            snr = seed_values(f"{key}/snr")
+            with np.errstate(invalid="ignore"):
+                # nan once a seed is infinite, i.e. a sensor carrying no noise.
+                snr_std = float(np.std(snr, ddof=1)) if snr.size > 1 else float("nan")
             rows.append(
                 {
                     "sensor": name,
                     "noise_rel_std": float(self._noise_cfg.get(name, 0.0)),
-                    "obs_abs_mean": mean[f"{key}/obs_abs_mean"],
-                    "obs_std": mean[f"{key}/obs_std"],
-                    "noise_std_at_1x": mean[f"{key}/noise_std_at_1x"],
-                    "noise_to_signal": mean[f"{key}/noise_to_signal"],
+                    "obs_rms": float(np.mean(seed_values(f"{key}/obs_rms"))),
+                    "obs_std": float(np.mean(seed_values(f"{key}/obs_std"))),
+                    "noise_std_at_1x": float(
+                        np.mean(seed_values(f"{key}/noise_std_at_1x"))
+                    ),
+                    "snr_mean": float(np.mean(snr)),
+                    "snr_std": snr_std,
                 }
             )
         return rows
@@ -485,18 +443,13 @@ class _TableLogger(SeedBufferLogger):
         # the step= line that super() emits.
         per_seed = self._buffers.get(step, {})
         if per_seed:
-            keys = list(next(iter(per_seed.values())).keys())
-            mean = {
-                k: float(np.mean([per_seed[r][k] for r in sorted(per_seed)]))
-                for k in keys
-            }
             elapsed = time.time() - (self.start_time or time.time())
             # At step 0 no training bucket has closed, so only eval is real.
             if step > 0:
-                rows = self._rows_from_metrics("obs_train", mean)
+                rows = self._rows("obs_train", per_seed)
                 if rows:
                     _print_table(f"TRAIN bucket @ step {step:,}", rows)
-            rows = self._rows_from_metrics("obs_eval", mean)
+            rows = self._rows("obs_eval", per_seed)
             if rows:
                 label = "pre-training" if step == 0 else f"step {step:,}"
                 _print_table(f"EVAL checkpoint @ {label} (t+{elapsed:.0f}s)", rows)
@@ -533,7 +486,6 @@ def main(cfg: Config) -> None:
         seed_ids=tuple(range(cfg.seed, cfg.seed + cfg.num_seeds)),
         job_type=cfg.algorithm,
         tags=cfg.wandb.tags,
-        layout=layout,
         names=names,
         noise_cfg=noise_cfg,
     )
@@ -583,26 +535,6 @@ def main(cfg: Config) -> None:
     jax.block_until_ready(jax.jit(jax.vmap(pre_eval))(seeds, run_idxs))
     ts, _ = train_fn(seeds, run_idxs)
     jax.block_until_ready(ts)
-
-    # --- End-of-run summary tables from the final accumulators ---
-    stats = _find_stats_state(ts.env_state)
-    count = np.asarray(stats.count)[..., None] * np.ones_like(np.asarray(stats.mean))
-    mean = np.asarray(stats.mean)
-    m2 = np.asarray(stats.m2)
-    flat = (
-        count.reshape(-1, n_buckets, count.shape[-1]),
-        mean.reshape(-1, n_buckets, mean.shape[-1]),
-        m2.reshape(-1, n_buckets, m2.shape[-1]),
-    )
-    train_count, train_mean, train_m2 = _merge(*flat, axis=0)
-    total_count, total_mean, total_m2 = _merge(
-        train_count, train_mean, train_m2, axis=0
-    )
-
-    total_rows = _sensor_rows(
-        layout, names, noise_cfg, total_count, total_mean, total_m2
-    )
-    _print_table("TOTAL - all training observations, all seeds", total_rows)
 
     logger.finish()
 
