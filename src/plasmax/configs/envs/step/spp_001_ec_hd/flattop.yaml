@@ -31,8 +31,6 @@ initialization: ${DATA_DIR}/initializations/step/spp_001_ec_hd/hot.yaml
 
 task:
   reward: P_diff
-  # Intentionally uncalibrated; STEP termination currently has no penalty.
-  terminal_penalty: 0.0
 
 tokamak: step
 reset_reference: step_hot_openstep_v1_4_2

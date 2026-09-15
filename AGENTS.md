@@ -133,14 +133,29 @@ Every leaf YAML stores task defaults:
 ```yaml
 task:
   reward: lh_transition
-  terminal_penalty: -100
 ```
 
 `make` has no variant or wrapper options. Wrappers resolve defaults from the
 already parsed `env.plasmax_config`; explicit wrapper arguments remain supported.
-Omitted reward and disruption-penalty arguments inherit task metadata; explicit
-overrides, including zero, must be preserved. KSTAR uses its native reward and
-null penalty.
+Omitted reward arguments inherit task metadata. A custom reward receives
+`(state, action, next_state, termination_code)` and owns the final reward; access
+the previous action through `state.prev_action`. KSTAR's native reward remains
+unchanged.
+
+Built-in TORAX rewards retain their existing objectives and soft safety barriers.
+Ordinary transitions return numerically stable squareplus of the raw score;
+disruption and solver failure return its logarithm, evaluated as
+`asinh(score / 2)`. Invalid states return zero with zero reward-branch gradient;
+sanitize invalid inputs before reward arithmetic. Initialization, reset, and
+rollout-padding rewards remain zero. There is no configurable terminal penalty
+or multiplier.
+
+The core casts final rewards to float32; custom rewards are otherwise unchanged.
+Nonfinite rewards pass through without an assertion or a termination-code change.
+Evaluation logging reports `evaluation/nonfinite_reward_rate` over valid
+transitions, excluding rollout padding. Do not sanitize rewards, add training
+reward instrumentation, or enable automatic NaN checks inside simulator
+arithmetic. Use ordinary JAX transformations for compiled callers and collection.
 
 `PhysicsRandomizationWrapper` owns its RNG and samples each configured scalar
 before every transition. The core consumes persistent `EnvState.phys_params`;
@@ -204,7 +219,7 @@ Control-algorithm runs use online W&B logging unless the user explicitly request
 silently downgrade to offline or disable logging; stop if authorization or
 initialization fails.
 
-Generic launchers inherit reward and terminal penalty from task metadata. Pass
+Generic launchers inherit reward from task metadata. Pass
 `--env.variant realistic` explicitly in recorded experiment commands even
 though it is already the CLI default. These research labels select explicit
 composition helpers in the launchers; they are not arguments to `make`.

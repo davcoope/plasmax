@@ -28,6 +28,7 @@ import platform
 import statistics
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -129,9 +130,8 @@ def _make_backward_pass(
         in_axes=(None, 0),
     )
 
-    @jax.jit
     def backward(current_theta: jax.Array, rollout_keys: jax.Array):
-        ((losses, alive_steps), per_env_grads) = per_env_value_and_grad(
+        (losses, alive_steps), per_env_grads = per_env_value_and_grad(
             current_theta,
             rollout_keys,
         )
@@ -151,7 +151,7 @@ def _make_backward_pass(
             finite,
         )
 
-    return lambda: backward(theta, keys)
+    return partial(jax.jit(backward), theta, keys)
 
 
 def _peak_bytes_in_use() -> int | None:

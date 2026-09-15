@@ -62,6 +62,42 @@ def _assert_same_pytree_values(left, right):
         np.testing.assert_array_equal(a, b)
 
 
+def _stub_torax_step(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    post_updates: dict[str, float] | None = None,
+    solver_error: int = 0,
+) -> None:
+    """Inject a cheap internal solve while retaining real stepper validation."""
+    original_step = core_lib.fixed_duration_step
+
+    def synthetic_step(sim_state, postout, max_dt, provider):
+        del provider
+        numeric = dataclasses.replace(
+            sim_state.solver_numeric_outputs,
+            solver_error_state=jnp.int32(solver_error),
+        )
+        next_sim = dataclasses.replace(
+            sim_state,
+            t=sim_state.t + max_dt,
+            dt=max_dt,
+            solver_numeric_outputs=numeric,
+        )
+        next_post = dataclasses.replace(
+            postout,
+            **{
+                name: jnp.asarray(value, dtype=getattr(postout, name).dtype)
+                for name, value in (post_updates or {}).items()
+            },
+        )
+        return next_sim, next_post
+
+    def fixed_duration_step(_step_fn, *args, **kwargs):
+        return original_step(synthetic_step, *args, **kwargs)
+
+    monkeypatch.setattr(core_lib, "fixed_duration_step", fixed_duration_step)
+
+
 class PlasmaxEnvContractTest:
     """Tests the public Envelope lifecycle and unchanged TORAX behaviour."""
 
@@ -172,8 +208,8 @@ class PlasmaxEnvContractTest:
         assert delta > 1e-3
 
     def test_custom_reward_fn_returns_postout_value(self):
-        def reward_fn(la, s, a, ns):
-            del la, s, a
+        def reward_fn(s, a, ns, termination_code):
+            del s, a, termination_code
             return ns.plasma.tau_E
 
         env = make_test_env(reward_fn=reward_fn)
@@ -213,7 +249,7 @@ class DisruptionContractTest:
 
     @staticmethod
     def _step_with(disruption, **kwargs):
-        env = make_test_env(disruption=disruption, disruption_penalty=-123.0, **kwargs)
+        env = make_test_env(disruption=disruption, **kwargs)
         state, init_info = env.init(jax.random.key(0))
         state, info = env.step(state, _ACTION)
         return init_info, state, info
@@ -233,11 +269,13 @@ class DisruptionContractTest:
         ids=("q-min", "greenwald"),
     )
     def test_configured_disruption_terminates(self, disruption, expected_code):
-        init_info, _, info = self._step_with(disruption)
+        init_info, state, info = self._step_with(disruption)
         assert bool(info.terminated)
         assert not bool(info.truncated)
         assert int(info.termination_code) == expected_code
-        np.testing.assert_array_equal(info.reward, -123.0)
+        np.testing.assert_allclose(
+            info.reward, jnp.arcsinh(state.plasma.Q_fusion / 2), rtol=1e-6, atol=0.0
+        )
         assert jax.tree.structure(info) == jax.tree.structure(init_info)
         assert _leaf_signature(info) == _leaf_signature(init_info)
 
@@ -247,59 +285,192 @@ class DisruptionContractTest:
         assert bool(info.terminated)
         assert int(info.termination_code) == 1
 
-    def test_solver_failure_has_highest_priority(self):
+    @pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+    def test_nonfinite_observation_has_priority_over_physical_disruptions(
+        self, monkeypatch, invalid_value
+    ):
         both = DisruptionConfig(q_min_threshold=1e9, greenwald_threshold=-1e9)
+        _stub_torax_step(monkeypatch)
 
         def nonfinite_obs(_plasma):
-            return jnp.full((_OBS_SIZE,), jnp.nan)
+            return jnp.full((_OBS_SIZE,), invalid_value)
 
         _, _, info = self._step_with(both, obs_fn=nonfinite_obs)
         assert bool(info.terminated)
         assert not bool(info.truncated)
-        assert int(info.termination_code) == 3
-        np.testing.assert_array_equal(info.reward, -123.0)
+        assert int(info.termination_code) == 4
+        np.testing.assert_array_equal(info.reward, 0.0)
 
-    def test_solver_numeric_failure_masks_nonfinite_reward_with_penalty(
-        self, monkeypatch
+    @pytest.mark.parametrize("invalid", [False, True])
+    def test_solver_and_invalid_state_priority(self, monkeypatch, invalid):
+        disruption = DisruptionConfig(q_min_threshold=1e9, greenwald_threshold=-1e9)
+        _stub_torax_step(
+            monkeypatch,
+            solver_error=1,
+            post_updates={"P_LH": np.nan} if invalid else None,
+        )
+        _, state, info = self._step_with(disruption)
+        assert jnp.all(jnp.isfinite(info.obs))
+        assert bool(info.terminated)
+        assert not bool(info.truncated)
+        assert int(info.termination_code) == (4 if invalid else 3)
+        expected = 0.0 if invalid else jnp.arcsinh(state.plasma.Q_fusion / 2)
+        np.testing.assert_allclose(info.reward, expected, rtol=1e-6, atol=0.0)
+
+    @pytest.mark.parametrize("field", ["P_cyclotron_e", "P_SOL_total", "P_LH"])
+    @pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+    def test_nonfinite_derived_output_terminates_with_finite_profiles(
+        self, monkeypatch, field, invalid_value
     ):
+        _stub_torax_step(monkeypatch, post_updates={field: invalid_value})
         disruption = DisruptionConfig(
             q_min_threshold=-1e9,
             greenwald_threshold=1e9,
         )
 
-        def nonfinite_reward(last_action, state, action, next_state):
-            del last_action, state, action, next_state
-            return jnp.asarray(jnp.nan)
+        def finite_reward(state, action, next_state, termination_code):
+            del state, action, next_state, termination_code
+            return jnp.asarray(2.0)
 
         env = make_test_env(
             disruption=disruption,
-            disruption_penalty=-123.0,
-            reward_fn=nonfinite_reward,
+            reward_fn=finite_reward,
         )
-        state, _ = env.init(jax.random.key(0))
-        original_step = core_lib.fixed_duration_step
+        state, init_info = env.init(jax.random.key(0))
+        next_state, info = env.step(state, _ACTION)
 
-        def force_solver_failure(*args, **kwargs):
-            result = original_step(*args, **kwargs)
-            numeric = dataclasses.replace(
-                result.sim_state.solver_numeric_outputs,
-                solver_error_state=jnp.int32(1),
+        for profile in ("T_e", "T_i", "n_e", "psi"):
+            np.testing.assert_array_equal(
+                getattr(next_state.plasma, profile), getattr(state.plasma, profile)
             )
-            sim_state = dataclasses.replace(
-                result.sim_state,
-                solver_numeric_outputs=numeric,
-            )
-            return dataclasses.replace(result, sim_state=sim_state)
+            assert jnp.all(jnp.isfinite(getattr(next_state.plasma, profile)))
+        assert jnp.all(jnp.isfinite(info.obs))
+        assert bool(info.terminated)
+        assert not bool(info.truncated)
+        assert int(info.termination_code) == 4
+        assert int(info.internal_steps) == 1
+        assert not bool(info.control_step_complete)
+        np.testing.assert_array_equal(info.reward, 2.0)
+        assert jax.tree.structure(info) == jax.tree.structure(init_info)
+        assert _leaf_signature(info) == _leaf_signature(init_info)
 
-        monkeypatch.setattr(core_lib, "fixed_duration_step", force_solver_failure)
-        _, info = env.step(state, _ACTION)
+    @pytest.mark.parametrize("field", ["P_cyclotron_e", "P_SOL_total", "P_LH"])
+    def test_finite_negative_derived_output_is_accepted(self, monkeypatch, field):
+        _stub_torax_step(monkeypatch, post_updates={field: -1.0})
+        disruption = DisruptionConfig(
+            q_min_threshold=-1e9,
+            greenwald_threshold=1e9,
+        )
+
+        def finite_reward(state, action, next_state, termination_code):
+            del state, action, next_state, termination_code
+            return jnp.asarray(2.0)
+
+        _, _, info = self._step_with(disruption, reward_fn=finite_reward)
+        assert not bool(info.terminated)
+        assert int(info.termination_code) == -1
+        assert bool(info.control_step_complete)
+        np.testing.assert_array_equal(info.reward, 2.0)
+
+    @pytest.mark.parametrize("greenwald_metric", ["line_avg", "volume_avg"])
+    @pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+    def test_nonfinite_selected_greenwald_metric_terminates(
+        self, monkeypatch, greenwald_metric, invalid_value
+    ):
+        disruption = DisruptionConfig(
+            q_min_threshold=-1e9,
+            greenwald_threshold=1e9,
+            greenwald_metric=greenwald_metric,
+        )
+        _stub_torax_step(
+            monkeypatch, post_updates={disruption.greenwald_field: invalid_value}
+        )
+        _, _, info = self._step_with(disruption)
 
         assert jnp.all(jnp.isfinite(info.obs))
         assert bool(info.terminated)
         assert not bool(info.truncated)
-        assert int(info.termination_code) == 3
-        np.testing.assert_array_equal(info.reward, -123.0)
-        assert bool(jnp.isfinite(info.reward))
+        assert int(info.termination_code) == 4
+        np.testing.assert_array_equal(info.reward, 0.0)
+
+    @pytest.mark.parametrize(
+        "raw_reward",
+        [np.nan, np.inf, -np.inf, 1e40],
+        ids=("nan", "positive-infinity", "negative-infinity", "float32-overflow"),
+    )
+    @pytest.mark.parametrize("execution", ["eager", "step", "scan", "batch"])
+    def test_nonfinite_float32_reward_passes_through(
+        self, monkeypatch, raw_reward, execution
+    ):
+        _stub_torax_step(monkeypatch)
+
+        def reward_fn(state, action, next_state, termination_code):
+            del state, action, next_state, termination_code
+            return jnp.asarray(raw_reward, dtype=jnp.float64)
+
+        env = make_test_env(
+            reward_fn=reward_fn,
+            disruption=DisruptionConfig(q_min_threshold=-1e9, greenwald_threshold=1e9),
+        )
+        state, _ = env.init(jax.random.key(0))
+        if execution == "eager":
+            _, info = env.step(state, _ACTION)
+        elif execution == "step":
+            _, info = jax.jit(env.step)(state, _ACTION)
+        elif execution == "scan":
+            _, info = jax.jit(
+                lambda s: jax.lax.scan(env.step, s, jnp.stack([_ACTION] * 2))
+            )(state)
+        else:
+            _, info = jax.jit(jax.vmap(env.step))(
+                jax.tree.map(lambda x: jnp.stack([x] * 2), state),
+                jnp.stack([_ACTION] * 2),
+            )
+
+        assert info.reward.dtype == jnp.float32
+        expected = np.nan if np.isnan(raw_reward) else np.copysign(np.inf, raw_reward)
+        np.testing.assert_array_equal(info.reward, np.full(info.reward.shape, expected))
+        np.testing.assert_array_equal(
+            info.terminated, np.zeros(info.reward.shape, bool)
+        )
+        np.testing.assert_array_equal(
+            info.termination_code, np.full(info.reward.shape, -1)
+        )
+
+    @pytest.mark.parametrize("code", [-1, 1, 2, 3, 4])
+    def test_custom_reward_receives_resolved_code_without_transformation(
+        self, monkeypatch, code
+    ):
+        _stub_torax_step(
+            monkeypatch,
+            solver_error=int(code == 3),
+            post_updates={"P_LH": np.nan} if code == 4 else None,
+        )
+        disruption = DisruptionConfig(
+            q_min_threshold=1e9 if code == 1 else -1e9,
+            greenwald_threshold=-1e9 if code == 2 else 1e9,
+        )
+
+        def reward_fn(state, action, next_state, termination_code):
+            # Access to previous action is retained through state.
+            return (
+                termination_code.astype(jnp.float32)
+                - 10.0
+                + (action[0] - state.prev_action[0]) * 1e-6
+                + next_state.plasma.t.astype(jnp.float32)
+            )
+
+        env = make_test_env(disruption=disruption, reward_fn=reward_fn)
+        state, _ = env.init(jax.random.key(0))
+        next_state, info = jax.jit(env.step)(state, _ACTION)
+        np.testing.assert_array_equal(info.termination_code, code)
+        np.testing.assert_array_equal(info.terminated, code != -1)
+        np.testing.assert_allclose(
+            info.reward,
+            code - 10.0 + float(next_state.plasma.t),
+            rtol=1e-6,
+            atol=0.0,
+        )
 
 
 class EnvStateTest:

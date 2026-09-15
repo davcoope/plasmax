@@ -16,7 +16,6 @@ initialization: ${DATA_DIR}/initializations/iter/baseline/hot.yaml
 
 task:
   reward: rampdown
-  terminal_penalty: -1325
 
 torax:
   profile_conditions:

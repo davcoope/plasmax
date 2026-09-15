@@ -13,8 +13,6 @@ initialization: ${DATA_DIR}/initializations/iter/baseline/hot.yaml
 
 task:
   reward: P_diff
-  # Intentionally uncalibrated; flat-top termination currently has no penalty.
-  terminal_penalty: 0.0
 
 torax:
   profile_conditions:

@@ -35,7 +35,6 @@ class Args:
     backend: str = "bohm_gyrobohm"
     reward: str = "P_diff"
     variant: str = "oracle"
-    disruption_penalty: float = -5.0
     eval_seed: int = 20_000
     eval_rollouts: int = 64
     eval_freq: int = 704_000
@@ -118,7 +117,6 @@ def _contract_errors(
 ) -> list[str]:
     if method == "direct_backprop":
         expected = {
-            "disruption_penalty": args.disruption_penalty,
             "rollout_steps": 4_400,
             "truncation_steps": 100,
             "num_rollouts": 16,
@@ -140,7 +138,6 @@ def _contract_errors(
     ppo_config = config.get("ppo", {})
     expected_env = {
         "transfer_backend": None,
-        "disruption_penalty": args.disruption_penalty,
         "eval_n_envs": args.eval_rollouts,
         "eval_seed": args.eval_seed,
         "deterministic_eval": True,

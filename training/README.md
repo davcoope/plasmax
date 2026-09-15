@@ -18,14 +18,19 @@ under `experiments/`. Generic evaluation and rollout commands remain in
 
 New runs default to the `realistic` research label, which selects
 `RealisticWrappers(make(...))`; `oracle` selects `OracleWrappers`. The launchers
-inherit reward and terminal penalty from task YAML metadata unless explicitly
-overridden. Wrapper options are passed to the composition helper. Training
+inherit the reward from task YAML metadata unless explicitly overridden.
+Termination shaping belongs to the reward function. Wrapper options are passed
+to the composition helper. Training
 defaults to online W&B logging.
 
 All agents expose `train(rng) -> (state, results)` and `make_act(state)`. Backprop
 and MPC use native Envelope training; PPO/SAC use upstream Rejax. Whole training
 can be jitted and vmapped across seeds with the same static configuration.
 TGLFNN training seeds must run as separate single-seed processes.
+
+Evaluation callbacks log `evaluation/nonfinite_reward_rate` over valid rollout
+transitions. This diagnostic does not replace nonfinite rewards, stop execution,
+or inspect training rewards.
 
 Every training launcher saves one inference-only MessagePack policy per seed.
 Files default to unique paths under `outputs/policies`; `--checkpoint-dir`

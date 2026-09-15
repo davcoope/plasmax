@@ -90,19 +90,15 @@ Equilibria generated with
 [FreeGSNKE](https://github.com/FusionComputingLab/freegsnke) are committed
 artifacts, so FreeGSNKE is not a runtime dependency.
 
-Every leaf task YAML owns its reward and terminal-penalty defaults:
+Every leaf task YAML owns its default reward:
 
 ```yaml
 task:
   reward: lh_transition
-  terminal_penalty: -100
 ```
 
-By default, `reward` and `disruption_penalty`; uses the task metadata.
-Explicit overrides are supported, including
-`disruption_penalty=0.0`. Ramp-up tasks use `lh_transition`, flat-top and STEP
-tasks use `P_diff`, and ramp-down tasks use `rampdown`. KSTAR uses its native
-learned-model reward and has no terminal penalty.
+Omitting `reward` uses the task default; built-in TORAX rewards apply squareplus
+normally, its logarithm on disruption or solver failure, and zero on invalid state.
 
 ```python
 env = RealisticWrappers(plasmax.make("iter/advanced/rampup", backend="qlknn"))
@@ -112,7 +108,6 @@ oracle_ablation = OracleWrappers(
         "iter/advanced/rampup",
         backend="qlknn",
         reward="Q_fusion",
-        disruption_penalty=0.0,
     )
 )
 ```
@@ -141,7 +136,7 @@ wrapper owns its RNG; `init(key)` and `reset(state, key)` seed these streams.
 
 - `info.obs`: the post-transition flat observation;
 - `info.reward`: a scalar float32 RL-boundary reward;
-- `info.terminated`: a physical or solver termination;
+- `info.terminated`: a physical, solver, or invalid-state termination;
 - `info.truncated`: the configured time-limit cutoff;
 - `info.termination_code`: the environment's termination reason.
 

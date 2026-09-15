@@ -248,6 +248,9 @@ def _torax_state_is_finite(
         & jnp.all(jnp.isfinite(core.n_e.value))
         & jnp.all(jnp.isfinite(core.psi.value))
         & jnp.isfinite(postout.P_fusion)
+        & jnp.isfinite(postout.P_cyclotron_e)
+        & jnp.isfinite(postout.P_SOL_total)
+        & jnp.isfinite(postout.P_LH)
         & jnp.isfinite(postout.q_min)
     )
 
@@ -264,8 +267,7 @@ class _ToraxDynamics:
         self,
         config: model_config.ToraxConfig,
         actuator_specs: Sequence[ActuatorSpec],
-        reward_fn: Callable[[jax.Array, EnvState, jax.Array, EnvState], jax.Array],
-        disruption_penalty: float = 0.0,
+        reward_fn: Callable[[EnvState, jax.Array, EnvState, jax.Array], jax.Array],
         clip_by_max_action_delta: bool = True,
         disruption: scenario_models.DisruptionConfig | None = None,
         obs_fn: (
@@ -309,7 +311,6 @@ class _ToraxDynamics:
         self._reward_fn = reward_fn
         self._max_action_delta = jnp.array([s.max_delta for s in actuator_specs])
         self._clip_by_max_action_delta = clip_by_max_action_delta
-        self._disruption_penalty = jnp.asarray(disruption_penalty)
         self._disruption_cfg = disruption or scenario_models.DisruptionConfig()
         self._stepping = stepping or scenario_models.SteppingConfig()
 
@@ -380,9 +381,6 @@ class _ToraxDynamics:
         # Keep TORAX physics in its configured precision while exposing a
         # stable float32 reward boundary to RL algorithms and scan carries.
         self._reward_dtype = jnp.float32
-        self._disruption_penalty = jnp.asarray(
-            self._disruption_penalty, dtype=self._reward_dtype
-        )
 
         obs_size = self._initial_obs.shape[0]
 
@@ -616,35 +614,35 @@ class _ToraxDynamics:
         )
         obs = self._observe(new_env_state.plasma)
 
-        q_min_disruption, greenwald_exceeded, solver_failure = self._disruption_terms(
-            new_env_state.plasma, obs
+        q_min_disruption, greenwald_exceeded, solver_failure, invalid_state = (
+            self._disruption_terms(new_env_state.plasma, obs)
         )
-        disruption = q_min_disruption | greenwald_exceeded | solver_failure
-        reward = jnp.asarray(
-            self._reward_fn(env_state.prev_action, env_state, action, new_env_state),
-            dtype=self._reward_dtype,
-        )
-        # On a disrupting/unphysical step the reward is the terminal penalty: the
-        # episode ends here, and reward_fn may itself be NaN if the state
-        # diverged, so select the penalty rather than propagate it.
-        reward = jnp.where(disruption, self._disruption_penalty, reward)
+        invalid_state = invalid_state | step_result.invalid_state
 
-        # Termination code priority is solver > q_min > greenwald. Time limits
+        # Priority is INVALID_STATE > solver > q_min > greenwald. Time limits
         # are exclusively the responsibility of TruncationWrapper.
         termination_code = jnp.where(
-            solver_failure,
-            jnp.int32(3),
+            invalid_state,
+            jnp.int32(4),
             jnp.where(
-                q_min_disruption,
-                jnp.int32(1),
-                jnp.where(greenwald_exceeded, jnp.int32(2), jnp.int32(-1)),
+                solver_failure,
+                jnp.int32(3),
+                jnp.where(
+                    q_min_disruption,
+                    jnp.int32(1),
+                    jnp.where(greenwald_exceeded, jnp.int32(2), jnp.int32(-1)),
+                ),
             ),
+        )
+        reward = jnp.asarray(
+            self._reward_fn(env_state, action, new_env_state, termination_code),
+            dtype=self._reward_dtype,
         )
 
         return new_env_state, _make_info(
             obs,
             reward,
-            disruption,
+            termination_code != -1,
             termination_code,
             internal_steps=step_result.internal_steps,
             sawtooth_crashes=step_result.sawtooth_crashes,
@@ -654,10 +652,10 @@ class _ToraxDynamics:
 
     def _disruption_terms(
         self, plasma: PlasmaState, obs: jax.Array
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Returns the ``(q_min, greenwald, solver_failure)`` termination booleans.
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Return ``(q_min, greenwald, solver_failure, invalid_state)`` flags.
 
-        The internal macro-step already checks every evolved core profile plus
+        The internal macro-step already checks the evolved core profiles plus
         its critical post-processed outputs after each accepted solve. This
         final gate adds the public observation and selected Greenwald metric,
         and recognizes the macro-step's aggregated failure status. The
@@ -668,12 +666,9 @@ class _ToraxDynamics:
         fgw = getattr(plasma, cfg.greenwald_field)
         q_min_disruption = jnp.min(plasma.core.q_face) < cfg.q_min_threshold
         greenwald_exceeded = fgw > cfg.greenwald_threshold
-        solver_failure = (
-            ~jnp.all(jnp.isfinite(obs))
-            | ~jnp.isfinite(fgw)
-            | (plasma.sim.solver_numeric_outputs.solver_error_state == 1)
-        )
-        return q_min_disruption, greenwald_exceeded, solver_failure
+        solver_failure = plasma.sim.solver_numeric_outputs.solver_error_state == 1
+        invalid_state = ~jnp.all(jnp.isfinite(obs)) | ~jnp.isfinite(fgw)
+        return q_min_disruption, greenwald_exceeded, solver_failure, invalid_state
 
     @property
     def actuator_specs(self) -> list[ActuatorSpec]:
@@ -722,8 +717,7 @@ class PlasmaxEnv(Environment):
         cls,
         config: model_config.ToraxConfig,
         actuator_specs: Sequence[ActuatorSpec],
-        reward_fn: Callable[[jax.Array, EnvState, jax.Array, EnvState], jax.Array],
-        disruption_penalty: float = 0.0,
+        reward_fn: Callable[[EnvState, jax.Array, EnvState, jax.Array], jax.Array],
         clip_by_max_action_delta: bool = True,
         disruption: scenario_models.DisruptionConfig | None = None,
         obs_fn: Callable[[PlasmaState], jax.Array] | None = None,
@@ -744,7 +738,6 @@ class PlasmaxEnv(Environment):
                 config=config,
                 actuator_specs=actuator_specs,
                 reward_fn=reward_fn,
-                disruption_penalty=disruption_penalty,
                 clip_by_max_action_delta=clip_by_max_action_delta,
                 disruption=disruption,
                 obs_fn=obs_fn,

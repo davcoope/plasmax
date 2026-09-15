@@ -104,7 +104,7 @@ class WrapperDefaultsTest:
                 },
             }
         )
-        cls.base = _build_env(cfg, reward=None, disruption_penalty=None)
+        cls.base = _build_env(cfg, reward=None)
 
     def test_defaults_resolve_against_each_inner_layout_and_action_order(self):
         noise = NoiseWrapper(self.base)
@@ -780,7 +780,6 @@ class TruncationWrapperTest:
 
     def test_termination_wins_at_cutoff(self):
         base = _make_base_env(
-            disruption_penalty=7.0,
             disruption=DisruptionConfig(q_min_threshold=1e6, greenwald_threshold=1e9),
         )
         env = TruncationWrapper(base, max_steps=1)

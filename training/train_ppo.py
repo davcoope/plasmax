@@ -61,9 +61,6 @@ from experiments.plotting.wandb_logging import (
     make_world_model_training_callback,
 )
 from experiments.studies.baseline_study import seed_keys
-from experiments.studies.disruption_sweep import (
-    calibrated_disruption_penalty,
-)
 from plasmax.environment.factory import make
 from plasmax.environment.registry import resolve_backend
 from plasmax.wrappers import OracleWrappers, RealisticWrappers
@@ -96,10 +93,6 @@ class EnvConfig:
     # Evaluate the distribution mode rather than sampling policy actions.
     deterministic_eval: bool = False
     dt: float = 0.1  # must match the env YAML's numerics.fixed_dt
-    # Omitted values inherit the task YAML. Explicit zero disables the penalty.
-    disruption_penalty: float | None = None
-    # Optional sensitivity-study multiplier for the task YAML penalty.
-    disruption_kappa: float | None = None
     # Force the returns-only eval callback even for a TORAX backend (auto-on for
     # world-model envs, and always used when num_seeds > 1). Skips the
     # physics/geometry logging graph.
@@ -211,11 +204,6 @@ def _run_name(cfg: Config) -> str:
         name += "-time_aware"
     if cfg.env.quantize_bins is not None:
         name += f"-q{cfg.env.quantize_bins}"
-    if cfg.env.disruption_penalty is not None:
-        if cfg.env.disruption_penalty != 0.0:
-            name += f"-dp{cfg.env.disruption_penalty:.4g}"
-    elif cfg.env.disruption_kappa is not None:
-        name += f"-kappa{cfg.env.disruption_kappa:g}"
     if cfg.ppo.residual_policy:
         name += "-residual"
     if cfg.env.deterministic_eval:
@@ -278,23 +266,10 @@ def _build_algo(cfg: Config, env):
 def _load_env(cfg: Config, backend_alias_or_path: str | None):
     # make resolves registry aliases for both env_setup and backend
     # internally (plasmax.environment.registry.resolve_env/resolve_backend).
-    if cfg.env.disruption_penalty is not None:
-        disruption_penalty = cfg.env.disruption_penalty
-    elif cfg.env.disruption_kappa is not None:
-        if backend_alias_or_path is None:
-            raise ValueError("disruption_kappa is only valid for TORAX environments")
-        disruption_penalty = calibrated_disruption_penalty(
-            cfg.env.env_setup,
-            backend_alias_or_path,
-            kappa=cfg.env.disruption_kappa,
-        )
-    else:
-        disruption_penalty = None
     env = make(
         cfg.env.env_setup,
         backend_alias_or_path,
         reward=cfg.env.reward,
-        disruption_penalty=disruption_penalty,
     )
     if cfg.env.variant == "oracle":
         if cfg.env.quantize_bins is not None:

@@ -372,19 +372,17 @@ def test_rejax_seed_exports_have_scalar_progress_and_nested_configuration(
 
 
 @pytest.mark.parametrize(
-    "effective,explicit,kappa,expected",
+    "effective,explicit,expected",
     [
-        (-75.0, None, 0.75, -75.0),
-        (None, 0.0, 2.0, 0.0),
-        (None, None, 0.75, -75.0),
-        (None, None, None, -100.0),
+        ("Q_fusion", None, "Q_fusion"),
+        (None, "Q_fusion", "Q_fusion"),
+        (None, None, "lh_transition"),
     ],
 )
-def test_environment_reconstruction_preserves_penalty_and_source_clock(
+def test_environment_reconstruction_preserves_reward_and_source_clock(
     monkeypatch,
     effective,
     explicit,
-    kappa,
     expected,
 ):
     env = _env()
@@ -405,21 +403,17 @@ def test_environment_reconstruction_preserves_penalty_and_source_clock(
             "env": {
                 "env_setup": "mock/circular/smoke",
                 "backend": "mock",
-                "disruption_penalty": explicit,
-                "disruption_kappa": kappa,
+                "reward": explicit,
             }
         },
-        "source_config": {
-            "task": {"terminal_penalty": -100, "reward": "lh_transition"}
-        },
+        "source_config": {"task": {"reward": "lh_transition"}},
         "source_max_steps": 2,
     }
     if effective is not None:
-        metadata["effective_task"] = {"terminal_penalty": effective}
+        metadata["effective_task"] = {"reward": effective}
     policy = LoadedPolicy("ppo", {}, environment_interface(env), metadata, True)
     assert runs.load_policy_env(policy) is env
-    assert calls[0][1]["disruption_penalty"] == expected
-    assert calls[0][1]["reward"] == "lh_transition"
+    assert calls[0][1] == {"reward": expected}
     assert calls[1]["time_aware"] is True
     assert calls[1]["max_steps"] == 2
 

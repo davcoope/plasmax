@@ -20,10 +20,6 @@ initialization: ${DATA_DIR}/initializations/iter/hybrid/settled.yaml
 
 task:
   reward: P_diff
-  # Maximum auxiliary power is 101 MW, so even a zero-fusion full-horizon
-  # trajectory returns about -444 at worst. Keep every physical disruption or
-  # solver failure strictly worse than completing that valid trajectory.
-  terminal_penalty: -1000
 
 torax:
   profile_conditions:

@@ -47,13 +47,12 @@ class ConfiguredEnv(NamedObservationEnv):
             "environment_key": "mock/circular/smoke",
             "task": {
                 "reward": "lh_transition",
-                "terminal_penalty": -100.0,
             },
         }
 
     @property
     def _dynamics(self):
-        return SimpleNamespace(_reward_fn=rewards.Q_fusion, _disruption_penalty=0.0)
+        return SimpleNamespace(_reward_fn=rewards.Q_fusion)
 
 
 def _rejax_agent(algorithm: str, action_kind: str):
@@ -206,8 +205,8 @@ def test_effective_task_settings_are_distinct_from_configured_defaults(tmp_path)
         agent, agent.init_state(jax.random.key(0)), tmp_path / "overrides.msgpack"
     )
     metadata = load_policy(path).metadata
-    assert metadata["source_config"]["task"]["terminal_penalty"] == -100.0
-    assert metadata["effective_task"] == {"reward": "Q_fusion", "terminal_penalty": 0.0}
+    assert metadata["source_config"]["task"] == {"reward": "lh_transition"}
+    assert metadata["effective_task"] == {"reward": "Q_fusion"}
     assert metadata["source_max_steps"] == 2
 
 

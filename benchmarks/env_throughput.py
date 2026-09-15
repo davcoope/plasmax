@@ -21,6 +21,7 @@ import platform
 import statistics
 import time
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import jax
@@ -104,15 +105,13 @@ def _make_run(
 ) -> Callable[[], Any]:
     keys = jax.random.split(jax.random.key(SEED), n_envs)
 
-    @jax.jit
-    def run(keys):
-        if n_envs == 1 and not vmap_scalar:
-            return _rollout(env, keys[0], n_steps, reset_on_boundary)
-        return jax.vmap(lambda key: _rollout(env, key, n_steps, reset_on_boundary))(
-            keys
-        )
+    def rollout(key: jax.Array):
+        return _rollout(env, key, n_steps, reset_on_boundary)
 
-    return lambda: run(keys)
+    scalar = n_envs == 1 and not vmap_scalar
+    return partial(
+        jax.jit(rollout if scalar else jax.vmap(rollout)), keys[0] if scalar else keys
+    )
 
 
 def _time_run(env: Any, cfg: Config, n_envs: int) -> Timing:

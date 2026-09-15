@@ -6,7 +6,6 @@ initialization: ${DATA_DIR}/initializations/sparc/prd/hot.yaml
 
 task:
   reward: rampdown
-  terminal_penalty: -380
 torax:
   profile_conditions:
     Ip: {0: 8.7e+6, 5: 1.0e+6}

@@ -8,6 +8,7 @@ import numpy as np
 from envelope import TruncationWrapper
 
 from experiments.plotting.wandb_logging import (
+    _base_metrics,
     _collect_returns_and_lengths,
     _last_valid,
     _masked_band,
@@ -72,6 +73,52 @@ def test_mask_helpers_ignore_invalid_padding_and_select_last_valid():
     assert np.isnan(np.asarray(std[2]))
 
 
+def test_nonfinite_reward_rate_counts_valid_steps_under_jit_and_vmap():
+    rewards = jnp.asarray(
+        [
+            [[jnp.nan, jnp.inf, -jnp.inf], [1.0, jnp.nan, jnp.inf]],
+            [[1.0, 2.0, jnp.nan], [3.0, jnp.inf, -jnp.inf]],
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            [[jnp.nan, jnp.inf, -jnp.inf], [jnp.nan, jnp.inf, -jnp.inf]],
+        ]
+    )
+    valid = jnp.asarray(
+        [
+            [[True, True, True], [True, False, False]],
+            [[True, True, False], [True, False, False]],
+            [[True, True, True], [True, True, True]],
+            [[False, False, False], [False, False, False]],
+        ]
+    )
+
+    def metrics_for_rewards(reward: jax.Array, valid: jax.Array) -> dict:
+        traj = SimpleNamespace(
+            reward=reward,
+            valid=valid,
+            terminated=jnp.zeros_like(valid),
+            truncated=jnp.zeros_like(valid),
+            info=None,
+        )
+        returns = jnp.sum(jnp.where(valid, reward, 0.0), axis=1)
+        lengths = jnp.sum(valid, axis=1).astype(jnp.float32)
+        return _base_metrics(traj, returns, lengths, train_metrics=None)
+
+    metrics = jax.jit(jax.vmap(metrics_for_rewards))(rewards, valid)
+    np.testing.assert_allclose(
+        metrics["evaluation/nonfinite_reward_rate"],
+        [0.75, 0.0, 0.0, 0.0],
+        rtol=1e-7,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        metrics["evaluation/return_mean"],
+        [np.nan, 3.0, 10.5, 0.0],
+        rtol=1e-7,
+        atol=0.0,
+        equal_nan=True,
+    )
+
+
 def test_termination_metrics_separate_codes_truncation_and_invalid_padding():
     valid = jnp.asarray(
         [
@@ -79,6 +126,7 @@ def test_termination_metrics_separate_codes_truncation_and_invalid_padding():
             [True, False, False],
             [True, True, True],
             [True, False, False],
+            [True, True, False],
         ]
     )
     terminated = jnp.asarray(
@@ -87,6 +135,7 @@ def test_termination_metrics_separate_codes_truncation_and_invalid_padding():
             [False, True, False],  # Invalid padding must not count.
             [False, False, True],
             [True, False, False],
+            [False, True, False],
         ]
     )
     truncated = jnp.asarray(
@@ -95,14 +144,16 @@ def test_termination_metrics_separate_codes_truncation_and_invalid_padding():
             [True, False, False],
             [False, False, False],
             [False, False, False],
+            [False, False, False],
         ]
     )
     codes = jnp.asarray(
         [
             [-1, 1, -1],
-            [-1, 3, -1],
+            [-1, 4, -1],
             [-1, -1, 3],
             [2, -1, -1],
+            [-1, 4, -1],
         ],
         dtype=jnp.int32,
     )
@@ -115,30 +166,33 @@ def test_termination_metrics_separate_codes_truncation_and_invalid_padding():
 
     metrics = _termination_metrics(
         traj,
-        episode_returns=jnp.asarray([1.0, 2.0, 3.0, 4.0]),
-        episode_lengths=jnp.asarray([2.0, 1.0, 3.0, 1.0]),
+        episode_returns=jnp.asarray([1.0, 2.0, 3.0, 4.0, 5.0]),
+        episode_lengths=jnp.asarray([2.0, 1.0, 3.0, 1.0, 2.0]),
     )
     np.testing.assert_allclose(
-        metrics["termination/completion_rate"], 0.25, rtol=1e-7, atol=0.0
+        metrics["termination/completion_rate"], 0.2, rtol=1e-7, atol=0.0
     )
     np.testing.assert_allclose(
-        metrics["termination/termination_rate"], 0.75, rtol=1e-7, atol=0.0
+        metrics["termination/termination_rate"], 0.8, rtol=1e-7, atol=0.0
     )
     np.testing.assert_allclose(
-        metrics["termination/q_min_disruption_rate"], 0.25, rtol=1e-7, atol=0.0
+        metrics["termination/q_min_disruption_rate"], 0.2, rtol=1e-7, atol=0.0
     )
     np.testing.assert_allclose(
         metrics["termination/greenwald_disruption_rate"],
-        0.25,
+        0.2,
         rtol=1e-7,
         atol=0.0,
     )
     np.testing.assert_allclose(
-        metrics["termination/solver_failure_rate"], 0.25, rtol=1e-7, atol=0.0
+        metrics["termination/solver_failure_rate"], 0.2, rtol=1e-7, atol=0.0
+    )
+    np.testing.assert_allclose(
+        metrics["termination/invalid_state_rate"], 0.2, rtol=1e-7, atol=0.0
     )
     np.testing.assert_allclose(
         metrics["evaluation/episode_fraction_mean"],
-        7.0 / 12,
+        9.0 / 15,
         rtol=1e-7,
         atol=0.0,
     )
@@ -168,6 +222,9 @@ def test_termination_metrics_all_completed():
     )
     np.testing.assert_allclose(
         metrics["termination/termination_rate"], 0.0, rtol=1e-7, atol=0.0
+    )
+    np.testing.assert_allclose(
+        metrics["termination/invalid_state_rate"], 0.0, rtol=1e-7, atol=0.0
     )
     np.testing.assert_allclose(
         metrics["evaluation/episode_fraction_mean"], 1.0, rtol=1e-7, atol=0.0

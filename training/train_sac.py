@@ -47,7 +47,6 @@ class EnvConfig:
     transfer_backend: str | None = None
     reward: str | None = None
     variant: Literal["oracle", "realistic"] = "realistic"
-    disruption_penalty: float | None = None
     eval_n_envs: int = 16
     eval_seed: int = 10_000
     deterministic_eval: bool = True
@@ -163,7 +162,6 @@ def _load_envelope(cfg: Config, backend: str | None):
             cfg.env.env_setup,
             backend,
             reward=cfg.env.reward,
-            disruption_penalty=cfg.env.disruption_penalty,
         )
     )
 

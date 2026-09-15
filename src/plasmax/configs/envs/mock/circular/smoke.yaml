@@ -16,8 +16,6 @@ initialization: ${DATA_DIR}/initializations/mock/circular/nominal.yaml
 
 task:
   reward: P_diff
-  # Intentionally uncalibrated; this is a smoke-test fixture.
-  terminal_penalty: 0.0
 
 torax:
   plasma_composition:

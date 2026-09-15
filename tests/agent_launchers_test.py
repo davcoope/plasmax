@@ -57,7 +57,7 @@ def test_backprop_launcher_passes_supported_constructor_options_and_clock_metada
         mode=mode,
         seed=37,
         num_seeds=2,
-        env=EnvConfig(reward=None, disruption_penalty=0, eval_seed=42, eval_n_envs=3),
+        env=EnvConfig(reward=None, eval_seed=42, eval_n_envs=3),
         backprop=train_backprop.BackpropConfig(
             total_timesteps=80, eval_freq=12, num_rollouts=4
         ),
@@ -75,7 +75,6 @@ def test_backprop_launcher_passes_supported_constructor_options_and_clock_metada
     assert effective.env.time_aware == (mode == "open_loop")
     assert calls.loaded[0][0] is effective.env
     assert effective.env.reward is None
-    assert effective.env.disruption_penalty == 0
     assert effective.algorithm == f"backprop_{mode}"
     assert effective.algorithm in name
     assert cfg.env.time_aware is False
@@ -324,4 +323,3 @@ def test_launcher_defaults_keep_online_logging_and_realistic_wrapper_labels():
         assert config.wandb.mode == "online"
         assert config.env.variant == "realistic"
         assert config.env.reward is None
-        assert config.env.disruption_penalty is None

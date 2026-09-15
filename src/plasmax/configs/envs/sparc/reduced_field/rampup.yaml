@@ -5,7 +5,6 @@ initialization: ${DATA_DIR}/initializations/sparc/reduced_field/cold.yaml
 
 task:
   reward: lh_transition
-  terminal_penalty: -16
 torax:
   profile_conditions:
     Ip: {0: 1.0e+6, 10: 5.7e+6}

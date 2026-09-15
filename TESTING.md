@@ -138,18 +138,26 @@ JIT/eager parity.
 
 ## Configuration and task metadata
 
-Every leaf task YAML must specify `task.reward` and `task.terminal_penalty`.
+Every leaf task YAML must specify `task.reward`.
 Tests cover:
 
 - the phase-appropriate reward for every leaf task;
-- all ten calibrated ITER/SPARC ramp penalties exactly;
-- explicit `0.0` penalties for flat-top, STEP, and the mock smoke fixture;
-- KSTAR's native reward and null terminal penalty;
-- loader inheritance when reward and penalty are omitted;
+- KSTAR's unchanged native reward;
+- loader inheritance when reward is omitted;
 - string and callable reward overrides;
-- explicit zero overriding nonzero task metadata;
+- stable built-in squareplus for ordinary transitions and its logarithm for
+  disruption or solver failure, including gradients for large negative scores;
+- zero value and reward-branch gradient for invalid-state built-in rewards;
+- custom rewards receiving `(state, action, next_state, termination_code)` and
+  returning the final reward without an environment transformation;
+- nonfinite rewards passing through the float32 cast without changing termination;
+- evaluation nonfinite-reward rates excluding invalid rollout padding;
 - bare construction plus explicit realistic/oracle composition;
 - wrapper default resolution and persistent physics updates/reset behavior.
+
+Keep eager, JIT, vmap, scan, and gradient contracts covered with ordinary JAX
+transformations. Reward finiteness is an evaluation diagnostic, not an assertion
+inside simulator arithmetic.
 
 Initialization tests cover all task references from an unrelated working
 directory, typed YAML loading, numeric/scientific notation, stable serialization,

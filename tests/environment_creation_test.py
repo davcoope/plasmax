@@ -87,7 +87,6 @@ class PublicApiTest:
             "env",
             "backend",
             "reward",
-            "disruption_penalty",
         )
         assert (
             signature.parameters["env"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -100,7 +99,6 @@ class PublicApiTest:
             assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
         assert signature.parameters["backend"].default is None
         assert signature.parameters["reward"].default is None
-        assert signature.parameters["disruption_penalty"].default is None
 
     def test_backend_can_be_positional(self):
         assert make(_MOCK_ENV, _MOCK_BACKEND) is not None

@@ -112,7 +112,7 @@ def capture(config: Config) -> ToraxInitialization | KstarInitialization:
     if config.source_steps == 0:
         return document
     parsed = parsed.model_copy(update={"state_noise": {}, "physics_randomization": {}})
-    env = factory_lib._build_env(parsed, reward=None, disruption_penalty=None)
+    env = factory_lib._build_env(parsed, reward=None)
     state, _ = env.init(jax.random.key(config.seed))
     step = jax.jit(env.step)
     for index in range(config.source_steps):

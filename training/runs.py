@@ -32,7 +32,6 @@ class EnvConfig:
     transfer_backend: str | None = None
     reward: str | None = None
     variant: Literal["oracle", "realistic"] = "realistic"
-    disruption_penalty: float | None = None
     max_steps: int | None = None
     time_aware: bool = False
     eval_n_envs: int = 16
@@ -59,7 +58,6 @@ def load_env(config: EnvConfig, backend: str | None) -> Any:
             config.env_setup,
             backend,
             reward=config.reward,
-            disruption_penalty=config.disruption_penalty,
         ),
         max_steps=config.max_steps,
         time_aware=config.time_aware,
@@ -96,15 +94,6 @@ def load_policy_env(
         wrappers = OracleWrappers
     else:
         raise ValueError(f"unknown variant {selected_variant!r}")
-    penalty = effective.get("terminal_penalty", recorded.get("disruption_penalty"))
-    # PPO's optional study multiplier is resolved when the source env is made.
-    if penalty is None and recorded.get("disruption_kappa") is not None:
-        nominal = source.get("task", {}).get("terminal_penalty")
-        if nominal is None:
-            raise ValueError("policy lacks the source penalty for disruption_kappa")
-        penalty = nominal * recorded["disruption_kappa"]
-    if penalty is None:
-        penalty = source.get("task", {}).get("terminal_penalty")
     reward = (
         recorded.get("reward")
         or effective.get("reward")
@@ -112,9 +101,9 @@ def load_policy_env(
     )
     # KSTAR's native reward is not a make() override.
     if task == "kstar_worldmodel":
-        reward = penalty = None
+        reward = None
     env = wrappers(
-        make(task, selected_backend, reward=reward, disruption_penalty=penalty),
+        make(task, selected_backend, reward=reward),
         **options,
     )
     check_interfaces(policy, env)
