@@ -218,7 +218,6 @@ def _build_env(cfg: Config, bucket_size: int, n_buckets: int):
         cfg.env.env_setup,
         cfg.env.backend,
         reward=cfg.env.reward,
-        disruption_penalty=cfg.env.disruption_penalty,
     )
     plasmax_cfg = env.plasmax_config
     if plasmax_cfg.physics_randomization:
