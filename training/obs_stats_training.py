@@ -32,7 +32,6 @@ from plasmax.wrappers import (
     ObsFilterWrapper,
     PhysicsRandomizationWrapper,
     QuantizeActionWrapper,
-    SensorNoiseConfig,
     TruncationWrapper,
     _training_wrappers,
 )
@@ -107,9 +106,9 @@ class ObsStatsWrapper(Wrapper):
 
     def step(self, state: ObsStatsState, action):
         inner_state, info = self.env.step(state.inner_state, action)
-        # A solver-failure disruption (core.py's termination_code=3) can
-        # return a non-finite obs; core.py guards reward against this same
-        # case (`reward = jnp.where(disruption, ...)`), but not obs itself.
+        # An invalid-state disruption (core.py's termination_code=4) emits a
+        # non-finite obs. Skipping it keeps one NaN from poisoning the whole
+        # bucket, since Welford's recurrence has no recovery path.
         valid = jnp.all(jnp.isfinite(info.obs))
         bucket = jnp.minimum(state.step // self.bucket_size, self.n_buckets - 1)
 
@@ -206,13 +205,14 @@ def _obs_metrics(prefix, layout, names, noise_cfg, count, mean, m2):
 
 
 def _build_env(cfg: Config, bucket_size: int, n_buckets: int):
-    """RealisticWrappers, plus noise scaling and the statistics wrapper.
+    """RealisticWrappers, plus the statistics wrapper.
 
-    Mirrors ``plasmax.wrappers.RealisticWrappers`` exactly, with two
-    additions: sensor noise magnitudes are scaled by
-    ``--env.noise-multiplier``, and ObsStatsWrapper is inserted after the
-    observation degradations (so it sees the degraded observation) but
-    before the training wrappers (so it is unaffected by action rescaling).
+    Mirrors ``plasmax.wrappers.RealisticWrappers`` exactly, with one
+    addition: ObsStatsWrapper is inserted after the observation degradations
+    (so it sees the degraded observation) but before the training wrappers
+    (so it is unaffected by action rescaling). That mid-stack injection is
+    why the composition is repeated here rather than delegated; keep this in
+    step with RealisticWrappers when pulling upstream.
     """
     env = make(
         cfg.env.env_setup,
@@ -225,15 +225,7 @@ def _build_env(cfg: Config, bucket_size: int, n_buckets: int):
 
     real = plasmax_cfg.observations.realistic
     if real.noise:
-        scaled = {
-            name: value * cfg.env.noise_multiplier for name, value in real.noise.items()
-        }
-        layout = env.obs_layout()
-        sensors = layout.profile_names + layout.scalar_names
-        noise_scale = SensorNoiseConfig(
-            relative_std={k: v for k, v in scaled.items() if k in sensors}
-        ).to_noise_scale(layout)
-        env = NoiseWrapper(env, noise_scale=noise_scale)
+        env = NoiseWrapper(env, noise_multiplier=cfg.env.noise_multiplier)
     if real.resolution:
         env = ObsFilterWrapper.from_resolution_config(env)
     if real.filter is not None:
