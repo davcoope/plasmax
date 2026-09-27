@@ -86,12 +86,19 @@ def P_diff(
     action: jax.Array,
     next_state: EnvState,
     termination_code: jax.Array,
+    *,
+    score_scale: float = 1.0,
 ) -> jax.Array:
-    """Fusion power minus auxiliary heating power, in GW."""
+    """Fusion power minus auxiliary heating power, in GW, times ``score_scale``.
+
+    ``score_scale`` > 1 amplifies P_diff relative to squareplus's ~1/step
+    survival utility; bind it with ``functools.partial``."""
     del state, action
     fusion = _valid_input(next_state.plasma.P_fusion, termination_code)
     auxiliary = _valid_input(next_state.plasma.P_aux_total, termination_code)
-    return _terminal_reward((fusion - auxiliary) * 1e-9, termination_code)
+    return _terminal_reward(
+        score_scale * (fusion - auxiliary) * 1e-9, termination_code
+    )
 
 
 def W_thermal(

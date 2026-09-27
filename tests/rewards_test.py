@@ -74,6 +74,30 @@ class NamedRewardsTest:
             rtol=0.0,
         )
 
+    def test_P_diff_score_scale_multiplies_score_before_squareplus(self):
+        scale = 10.0
+        score = scale * (
+            (self._state.plasma.P_fusion - self._state.plasma.P_aux_total) * 1e-9
+        )
+        np.testing.assert_allclose(
+            rewards_lib.P_diff(
+                self._state, self._action, self._state, jnp.int32(-1),
+                score_scale=scale,
+            ),
+            _positive_reference(score),
+            atol=1e-6,
+            rtol=0.0,
+        )
+        np.testing.assert_allclose(
+            rewards_lib.P_diff(
+                self._state, self._action, self._state, jnp.int32(1),
+                score_scale=scale,
+            ),
+            np.log(_positive_reference(score)),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
     def test_P_diff_below_unit_baseline_when_fusion_below_aux(self):
         # Independent semantic check (the expression test above mirrors the
         # implementation, so it cannot catch a wrong sign or unit scale).

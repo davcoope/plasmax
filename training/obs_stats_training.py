@@ -35,7 +35,7 @@ from plasmax.wrappers import (
     TruncationWrapper,
     _training_wrappers,
 )
-from training.train_ppo import Config, _build_algo, _run_name
+from training.train_ppo import Config, _build_algo, _reward_arg, _run_name
 from training.vmap_logging import SeedBufferLogger
 
 # ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ def _build_env(cfg: Config, bucket_size: int, n_buckets: int):
     env = make(
         cfg.env.env_setup,
         cfg.env.backend,
-        reward=cfg.env.reward,
+        reward=_reward_arg(cfg),
     )
     plasmax_cfg = env.plasmax_config
     if plasmax_cfg.physics_randomization:

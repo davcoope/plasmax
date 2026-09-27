@@ -35,6 +35,7 @@ Run inside Docker, e.g.:
 # ruff: noqa: E402
 
 import dataclasses
+import functools
 import time
 from pathlib import Path
 from typing import Literal
@@ -61,6 +62,8 @@ from experiments.plotting.wandb_logging import (
     make_world_model_training_callback,
 )
 from experiments.studies.baseline_study import seed_keys
+from plasmax import rewards as rewards_lib
+from plasmax.environment.config import parse_env_and_backend
 from plasmax.environment.factory import make
 from plasmax.environment.registry import resolve_backend
 from plasmax.wrappers import OracleWrappers, RealisticWrappers
@@ -102,6 +105,9 @@ class EnvConfig:
     # Scales all wrappers.yaml noise magnitudes (0 = no noise). Relative
     # proportions between sensors are preserved.
     noise_multiplier: float = 1.0
+    # Multiplies the P_diff score before squareplus (1 = upstream reward).
+    # Only valid when the reward (explicit or the env's default) is P_diff.
+    reward_score_scale: float = 1.0
     # Discretize every actuator into this many evenly spaced bins (MultiDiscrete
     # action space; realistic variant only). None = continuous actions.
     quantize_bins: int | None = None
@@ -207,6 +213,8 @@ def _run_name(cfg: Config) -> str:
         name += "-time_aware"
     if cfg.env.quantize_bins is not None:
         name += f"-q{cfg.env.quantize_bins}"
+    if cfg.env.reward_score_scale != 1.0:
+        name += f"-rs{cfg.env.reward_score_scale:g}"
     if cfg.ppo.residual_policy:
         name += "-residual"
     if cfg.env.deterministic_eval:
@@ -266,13 +274,30 @@ def _build_algo(cfg: Config, env):
     )
 
 
+def _reward_arg(cfg: Config) -> str | rewards_lib.RewardFn | None:
+    """The ``reward`` passed to ``make``, with ``reward_score_scale`` bound."""
+    scale = cfg.env.reward_score_scale
+    if scale == 1.0:
+        return cfg.env.reward
+    reward = cfg.env.reward
+    if reward is None:  # fall back to the env YAML's task reward, as make() does
+        parsed = parse_env_and_backend(cfg.env.env_setup, cfg.env.backend)
+        reward = getattr(getattr(parsed, "task", None), "reward", None)
+    if reward != "P_diff":
+        raise ValueError(
+            f"reward_score_scale={scale:g} only applies to the P_diff reward, "
+            f"got {reward!r}"
+        )
+    return functools.partial(rewards_lib.P_diff, score_scale=scale)
+
+
 def _load_env(cfg: Config, backend_alias_or_path: str | None):
     # make resolves registry aliases for both env_setup and backend
     # internally (plasmax.environment.registry.resolve_env/resolve_backend).
     env = make(
         cfg.env.env_setup,
         backend_alias_or_path,
-        reward=cfg.env.reward,
+        reward=_reward_arg(cfg),
     )
     if cfg.env.variant == "oracle":
         if cfg.env.quantize_bins is not None:
