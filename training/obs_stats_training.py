@@ -23,6 +23,7 @@ from envelope import WrappedState, Wrapper, field, static_field
 from experiments.plotting.wandb_logging import (
     _base_metrics,
     _collect_returns_and_lengths,
+    _masked_mean,
 )
 from experiments.studies.baseline_study import seed_keys
 from plasmax.environment.factory import make
@@ -34,6 +35,7 @@ from plasmax.wrappers import (
     QuantizeActionWrapper,
     TruncationWrapper,
     _training_wrappers,
+    unwrap_to_env_state,
 )
 from training.train_ppo import Config, _build_algo, _reward_arg, _run_name
 from training.vmap_logging import SeedBufferLogger
@@ -254,6 +256,25 @@ def _sensor_slices(env):
     return layout, names
 
 
+def _physics_metrics(traj, actuator_names):
+    """Eval means of unscaled P_diff (GW) and applied actuators (powers in MW).
+
+    P_diff is 0 on terminal steps, matching the old raw-P_diff reward.
+    """
+    env_state = unwrap_to_env_state(traj.env_state)
+    plasma = env_state.plasma
+    live = traj.info.termination_code == -1
+    p_diff = jnp.where(live, (plasma.P_fusion - plasma.P_aux_total) * 1e-9, 0.0)
+    metrics = {"physics_eval/P_diff_GW": _masked_mean(p_diff, traj.valid)}
+    applied = _masked_mean(env_state.prev_action, traj.valid)
+    for i, name in enumerate(actuator_names):
+        if name.startswith("P_"):
+            metrics[f"actuators_eval/{name}_MW"] = applied[i] * 1e-6
+        else:
+            metrics[f"actuators_eval/{name}"] = applied[i]
+    return metrics
+
+
 # ---------------------------------------------------------------------------
 # Eval callback
 # ---------------------------------------------------------------------------
@@ -265,6 +286,7 @@ def _make_logging_callback(
     layout,
     names,
     noise_cfg,
+    actuator_names,
     bucket_size,
     n_buckets,
     num_steps,
@@ -277,7 +299,9 @@ def _make_logging_callback(
     Emits exactly the metrics a normal ``train_ppo.py`` run emits, plus the
     observation statistics for the training bucket that just finished
     (``obs_train/*``, read out of ``ts.env_state``) and for this checkpoint's
-    own eval rollouts (``obs_eval/*``, computed from the eval trajectory).
+    own eval rollouts (``obs_eval/*``, computed from the eval trajectory),
+    and the eval rollouts' true P_diff and applied actuator means
+    (``physics_eval/*``, ``actuators_eval/*``; see :func:`_physics_metrics`).
     Routing through ``logger.log`` via ``jax.debug.callback`` means it
     appears live during training rather than only at the end. Each seed
     reports its own statistics; :class:`_TableLogger` combines them across
@@ -342,6 +366,7 @@ def _make_logging_callback(
                     eval_m2,
                 )
             )
+            metrics.update(_physics_metrics(traj, actuator_names))
             jax.debug.callback(logger.log, ts.global_step, run_idx, metrics)
             return episode_returns, episode_lengths
 
@@ -444,6 +469,13 @@ class _TableLogger(SeedBufferLogger):
             if rows:
                 label = "pre-training" if step == 0 else f"step {step:,}"
                 _print_table(f"EVAL checkpoint @ {label} (t+{elapsed:.0f}s)", rows)
+            p_diff = np.asarray(
+                [per_seed[r]["physics_eval/P_diff_GW"] for r in sorted(per_seed)]
+            )
+            spread = float(np.std(p_diff, ddof=1)) if p_diff.size > 1 else 0.0
+            print(
+                f"EVAL P_diff = {np.mean(p_diff):.4f} ±{spread:.4f} GW (across seeds)"
+            )
             print()
         super()._flush_step(step)
 
@@ -489,6 +521,7 @@ def main(cfg: Config) -> None:
         layout=layout,
         names=names,
         noise_cfg=noise_cfg,
+        actuator_names=[spec.name for spec in env.actuator_specs],
         bucket_size=bucket_size,
         n_buckets=n_buckets,
         num_steps=algo.env_params.max_steps_in_episode,
