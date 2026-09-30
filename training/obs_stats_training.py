@@ -257,15 +257,17 @@ def _sensor_slices(env):
 
 
 def _physics_metrics(traj, actuator_names):
-    """Eval means of unscaled P_diff (GW) and applied actuators (powers in MW).
+    """Eval P_diff return (GW summed over steps) and mean applied actuators (MW).
 
-    P_diff is 0 on terminal steps, matching the old raw-P_diff reward.
+    P_diff return is the per-episode sum of unscaled P_diff, averaged over eval
+    episodes.
     """
     env_state = unwrap_to_env_state(traj.env_state)
     plasma = env_state.plasma
     live = traj.info.termination_code == -1
     p_diff = jnp.where(live, (plasma.P_fusion - plasma.P_aux_total) * 1e-9, 0.0)
-    metrics = {"physics_eval/P_diff_GW": _masked_mean(p_diff, traj.valid)}
+    p_diff_return = jnp.sum(jnp.where(traj.valid, p_diff, 0.0), axis=1).mean()
+    metrics = {"physics_eval/P_diff_return": p_diff_return}
     applied = _masked_mean(env_state.prev_action, traj.valid)
     for i, name in enumerate(actuator_names):
         if name.startswith("P_"):
@@ -469,12 +471,15 @@ class _TableLogger(SeedBufferLogger):
             if rows:
                 label = "pre-training" if step == 0 else f"step {step:,}"
                 _print_table(f"EVAL checkpoint @ {label} (t+{elapsed:.0f}s)", rows)
-            p_diff = np.asarray(
-                [per_seed[r]["physics_eval/P_diff_GW"] for r in sorted(per_seed)]
+            runs = sorted(per_seed)
+            p_diff = np.asarray([per_seed[r]["physics_eval/P_diff_return"] for r in runs])
+            length = np.asarray(
+                [per_seed[r]["evaluation/episode_length_mean"] for r in runs]
             )
             spread = float(np.std(p_diff, ddof=1)) if p_diff.size > 1 else 0.0
             print(
-                f"EVAL P_diff = {np.mean(p_diff):.4f} ±{spread:.4f} GW (across seeds)"
+                f"EVAL P_diff return = {np.mean(p_diff):.1f} ±{spread:.1f} GW·steps "
+                f"(mean {np.mean(p_diff / length):.4f} GW/step; across seeds)"
             )
             print()
         super()._flush_step(step)
