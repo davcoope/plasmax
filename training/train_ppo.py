@@ -37,6 +37,7 @@ Run inside Docker, e.g.:
 import dataclasses
 import functools
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -53,20 +54,22 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 import wandb
+from envelope import Environment
 
 from agents.ppo import PPOAdapter
-from experiments.plotting.wandb_logging import (
-    make_buffered_seed_callback,
-    make_minimal_training_callback,
-    make_training_callback,
-    make_world_model_training_callback,
-)
 from experiments.studies.baseline_study import seed_keys
 from plasmax import rewards as rewards_lib
 from plasmax.environment.config import parse_env_and_backend
 from plasmax.environment.factory import make
 from plasmax.environment.registry import resolve_backend
-from plasmax.wrappers import OracleWrappers, RealisticWrappers
+from plasmax.wrappers import (
+    NoiseWrapper,
+    ObsDelayWrapper,
+    ObsFilterWrapper,
+    OracleWrappers,
+    PhysicsRandomizationWrapper,
+    RealisticWrappers,
+)
 from scripts.project_paths import wandb_dir
 from training.envelope_gymnax import EnvelopeGymnax
 from training.evaluation import (
@@ -74,6 +77,21 @@ from training.evaluation import (
 )
 from training.runs import evaluate_transfer, save_run_policies, validate_seeds
 from training.vmap_logging import SeedBufferLogger
+from training.wandb_logging import (
+    make_buffered_seed_callback,
+    make_minimal_training_callback,
+    make_training_callback,
+    make_world_model_training_callback,
+)
+
+# Insertion order matches RealisticWrappers, regardless of CLI token order.
+_WRAPPER_FACTORIES: dict[str, Callable[[Environment], Environment]] = {
+    "physics": PhysicsRandomizationWrapper,
+    "noise": NoiseWrapper,
+    "resolution": ObsFilterWrapper.from_resolution_config,
+    "filter": ObsFilterWrapper,
+    "delay": ObsDelayWrapper,
+}
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
@@ -89,7 +107,10 @@ class EnvConfig:
     # therefore obs/action spaces, with `backend`). Registry alias.
     transfer_backend: str | None = None
     reward: str | None = None
-    variant: Literal["oracle", "realistic"] = "realistic"
+    # Preset (oracle/realistic) or slash-separated wrapper aliases, applied in
+    # fixed order: physics/noise/resolution/filter/delay.
+    variant: str = "realistic"
+    # Number of episodes per training evaluation.
     eval_n_envs: int = 128
     # Fixed evaluation seed, independent of the training RNG.
     eval_seed: int = 0
@@ -134,11 +155,6 @@ class PPOConfig:
     normalize_observations: bool = False
     hidden_sizes: tuple[int, ...] = (64, 64)
     activation: str = "swish"
-    # Center the Gaussian mean on the environment's reset action setpoint and
-    # initialize the final residual layer to zero.
-    residual_policy: bool = False
-    # Initial log standard deviation for the residual Gaussian actor.
-    initial_log_std: float = 0.0
 
 
 @dataclasses.dataclass
@@ -165,6 +181,8 @@ class Config:
     # Optional display name and policy destination; default: outputs/policies.
     run_name: str | None = None
     checkpoint_dir: str | None = None
+    # Save inference policies and upload them as a W&B model artifact.
+    save_policy: bool = True
 
 
 def _fmt_steps(n: int) -> str:
@@ -215,8 +233,6 @@ def _run_name(cfg: Config) -> str:
         name += f"-q{cfg.env.quantize_bins}"
     if cfg.env.reward_score_scale != 1.0:
         name += f"-rs{cfg.env.reward_score_scale:g}"
-    if cfg.ppo.residual_policy:
-        name += "-residual"
     if cfg.env.deterministic_eval:
         name += "-det_eval"
     if cfg.num_seeds > 1:
@@ -268,8 +284,6 @@ def _build_algo(cfg: Config, env):
         agent_kwargs={
             "hidden_layer_sizes": cfg.ppo.hidden_sizes,
             "activation": cfg.ppo.activation,
-            "residual_policy": cfg.ppo.residual_policy,
-            "initial_log_std": cfg.ppo.initial_log_std,
         },
     )
 
@@ -291,7 +305,18 @@ def _reward_arg(cfg: Config) -> str | rewards_lib.RewardFn | None:
     return functools.partial(rewards_lib.P_diff, score_scale=scale)
 
 
-def _load_env(cfg: Config, backend_alias_or_path: str | None):
+def _load_env(cfg: Config, backend_alias_or_path: str | None) -> Environment:
+    variant = cfg.env.variant
+    selected = set() if variant in ("oracle", "realistic") else set(variant.split("/"))
+    unknown = selected - _WRAPPER_FACTORIES.keys()
+    if unknown:
+        raise ValueError(
+            f"Unknown wrapper aliases {sorted(unknown)}. "
+            f"Valid choices: {', '.join(_WRAPPER_FACTORIES)}; "
+            "whole-value presets: oracle, realistic"
+        )
+    if cfg.env.quantize_bins is not None and variant != "realistic":
+        raise ValueError("quantize_bins is a realistic action degradation")
     # make resolves registry aliases for both env_setup and backend
     # internally (plasmax.environment.registry.resolve_env/resolve_backend).
     env = make(
@@ -299,14 +324,15 @@ def _load_env(cfg: Config, backend_alias_or_path: str | None):
         backend_alias_or_path,
         reward=_reward_arg(cfg),
     )
-    if cfg.env.variant == "oracle":
-        if cfg.env.quantize_bins is not None:
-            raise ValueError("quantize_bins is a realistic action degradation")
-        return OracleWrappers(env, time_aware=cfg.env.time_aware)
-    return RealisticWrappers(
-        env, time_aware=cfg.env.time_aware, quantize_bins=cfg.env.quantize_bins,
-        noise_multiplier=cfg.env.noise_multiplier,
-    )
+    if variant == "realistic":
+        return RealisticWrappers(
+            env, time_aware=cfg.env.time_aware, quantize_bins=cfg.env.quantize_bins,
+            noise_multiplier=cfg.env.noise_multiplier,
+        )
+    for alias, wrapper in _WRAPPER_FACTORIES.items():
+        if alias in selected:
+            env = wrapper(env)
+    return OracleWrappers(env, time_aware=cfg.env.time_aware)
 
 
 # ---------------------------------------------------------------------------
@@ -383,20 +409,21 @@ def _run_single(cfg: Config, run_name: str) -> None:
     algo = _build_algo(cfg, env)
 
     ts, results, metrics = _train_single(cfg, env, algo)
-    paths = save_run_policies(
-        algo,
-        ts,
-        cfg,
-        run_name,
-        batched=False,
-        results=results,
-        metrics=metrics,
-    )
-    artifact = wandb.Artifact(run_name, type="model")
-    for path in paths:
-        artifact.add_file(str(path))
-        print(f"Saved policy to {path}", flush=True)
-    wandb.log_artifact(artifact)
+    if cfg.save_policy:
+        paths = save_run_policies(
+            algo,
+            ts,
+            cfg,
+            run_name,
+            batched=False,
+            results=results,
+            metrics=metrics,
+        )
+        artifact = wandb.Artifact(run_name, type="model")
+        for path in paths:
+            artifact.add_file(str(path))
+            print(f"Saved policy to {path}", flush=True)
+        wandb.log_artifact(artifact)
 
     if cfg.env.transfer_backend is not None:
         transfer_summary = evaluate_transfer(
@@ -507,21 +534,22 @@ def _run_vmap(cfg: Config, run_name: str) -> None:
         log_once.update(transfer_summary)
         write_transfer_summary(cfg.history_dir, run_name, transfer_summary)
 
-    checkpoints = save_run_policies(
-        algo,
-        ts,
-        cfg,
-        run_name,
-        batched=True,
-        results=results,
-        metrics=log_once,
-    )
-    if checkpoints:
-        artifact = wandb.Artifact(run_name, type="model")
-        for checkpoint in checkpoints:
-            artifact.add_file(str(checkpoint))
-            print(f"Saved checkpoint to {checkpoint}", flush=True)
-        logger.log_artifact(artifact)
+    if cfg.save_policy:
+        checkpoints = save_run_policies(
+            algo,
+            ts,
+            cfg,
+            run_name,
+            batched=True,
+            results=results,
+            metrics=log_once,
+        )
+        if checkpoints:
+            artifact = wandb.Artifact(run_name, type="model")
+            for checkpoint in checkpoints:
+                artifact.add_file(str(checkpoint))
+                print(f"Saved checkpoint to {checkpoint}", flush=True)
+            logger.log_artifact(artifact)
 
     logger.log_once(log_once)
     logger.finish()

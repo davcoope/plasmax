@@ -5,6 +5,8 @@ and log physics scalars (and, for the single-seed TORAX callback, interactive
 Plotly episode figures) to wandb via ``jax.experimental.io_callback``.
 """
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,13 +14,13 @@ import plotly.graph_objects as go
 import wandb
 from plotly.subplots import make_subplots
 
-from experiments.plotting.viz import (
+from plasmax.rollout import TrajectoryStep, collect_episodes
+from plasmax.wrappers import unwrap_to_env_state
+from training.envelope_gymnax import to_typed_key
+from training.wandb_figures import (
     PROFILE_LABELS,
     make_profile_rho_figure,
 )
-from plasmax.rollout import collect_episodes
-from plasmax.wrappers import unwrap_to_env_state
-from training.envelope_gymnax import to_typed_key
 
 # ---------------------------------------------------------------------------
 # Plot helpers
@@ -294,6 +296,30 @@ def _physics_scalar_metrics(traj, episode_returns, episode_lengths, train_metric
     }
 
 
+def evaluation_scalar_metrics(
+    traj: TrajectoryStep,
+    episode_returns: jax.Array,
+    episode_lengths: jax.Array,
+    train_metrics: Any | None = None,
+    *,
+    physics: bool | None = None,
+) -> dict[str, jax.Array]:
+    """Shared scalar schema for training callbacks and frozen-policy evaluation.
+
+    Physics observations, including ``obs/beta_N``, average the final valid
+    transition across evaluation episodes. Padding never enters those values.
+    Auto-detection keeps environments without plasma state (such as KSTAR)
+    supported without inventing TORAX quantities. Explicit ``physics=False``
+    preserves the lightweight callback option used by PPO/SAC.
+    """
+    if physics is None:
+        physics = (
+            getattr(unwrap_to_env_state(traj.env_state), "plasma", None) is not None
+        )
+    builder = _physics_scalar_metrics if physics else _base_metrics
+    return builder(traj, episode_returns, episode_lengths, train_metrics)
+
+
 def _log_scalars(step, metrics, summary_keys=()) -> tuple[int, dict]:
     """Host-side: prints a one-line summary, logs the scalars to wandb, and
     returns ``(step, scalars)`` as Python values for further logging."""
@@ -331,9 +357,9 @@ def make_buffered_seed_callback(
     num_steps: int,
     n_seeds: int = 4,
     kind: str = "physics",
-    lean: bool | None = None,
     eval_rng: jax.Array | None = None,
     deterministic: bool = False,
+    lean: bool | None = None,
     extra_metrics=None,
 ):
     """Scalars-only eval callback for vmapped multi-seed training.
@@ -351,16 +377,17 @@ def make_buffered_seed_callback(
         n_seeds: Eval rollouts per checkpoint *within* one training seed.
         kind: ``"physics"`` for TORAX envs or ``"minimal"`` for world-model /
             returns-only envs.
-        lean: Strip heavy, eval-unused SimState fields from the emitted eval
-            trajectory (TORAX envs only). Defaults to ``kind == "physics"``.
         eval_rng: Optional fixed evaluation key. When set, it overrides the
             evolving callback key, including across vmapped training seeds.
         deterministic: Use ``algo.make_deterministic_act(ts)`` instead of the
             stochastic policy action function.
+        lean: Whether TORAX eval trajectories should omit heavy fields that no
+            scalar metric reads. Defaults to true for physics callbacks and
+            false for generic/world-model callbacks.
         extra_metrics: Optional ``(train_state, train_metrics) -> dict`` hook.
     """
-    if lean is None:
-        lean = kind == "physics"
+
+    collect_lean = kind == "physics" if lean is None else lean
 
     def for_run(run_idx):
         def _callback(algo, ts, rng, train_metrics):
@@ -370,20 +397,16 @@ def make_buffered_seed_callback(
                 eval_rng if eval_rng is not None else rng,
                 num_steps,
                 n_seeds,
-                lean=lean,
+                lean=collect_lean,
                 deterministic=deterministic,
             )
-            if kind == "physics":
-                metrics = _physics_scalar_metrics(
-                    traj, episode_returns, episode_lengths, train_metrics
-                )
-            else:
-                metrics = _base_metrics(
-                    traj,
-                    episode_returns,
-                    episode_lengths,
-                    train_metrics,
-                )
+            metrics = evaluation_scalar_metrics(
+                traj,
+                episode_returns,
+                episode_lengths,
+                train_metrics,
+                physics=kind == "physics",
+            )
             if extra_metrics is not None:
                 metrics.update(extra_metrics(ts, train_metrics))
             jax.debug.callback(logger.log, ts.global_step, run_idx, metrics)
@@ -416,11 +439,12 @@ def make_minimal_training_callback(
             n_seeds,
             deterministic=deterministic,
         )
-        metrics = _base_metrics(
+        metrics = evaluation_scalar_metrics(
             traj,
             episode_returns,
             episode_lengths,
             train_metrics,
+            physics=False,
         )
         _io_log_scalars(
             ts.global_step, metrics, summary_keys=("evaluation/episode_length_mean",)
@@ -462,11 +486,12 @@ def make_world_model_training_callback(
             return jnp.abs(last[:, _idx[name]] - last[:, _idx[f"{name}_target"]])
 
         metrics = {
-            **_base_metrics(
+            **evaluation_scalar_metrics(
                 traj,
                 episode_returns,
                 episode_lengths,
                 train_metrics,
+                physics=False,
             ),
             "obs/betap": last[:, _idx["betap"]].mean(),
             "obs/q95": last[:, _idx["q95"]].mean(),
@@ -534,8 +559,8 @@ def make_training_callback(
         )
         env_state = unwrap_to_env_state(traj.env_state)
         plasma = env_state.plasma
-        metrics = _physics_scalar_metrics(
-            traj, episode_returns, episode_lengths, train_metrics
+        metrics = evaluation_scalar_metrics(
+            traj, episode_returns, episode_lengths, train_metrics, physics=True
         )
 
         # Actuator labels/scales for the actions figure, in action-vector order.

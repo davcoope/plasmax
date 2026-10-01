@@ -20,7 +20,7 @@ import numpy as np
 import tyro
 from envelope import WrappedState, Wrapper, field, static_field
 
-from experiments.plotting.wandb_logging import (
+from training.wandb_logging import (
     _base_metrics,
     _collect_returns_and_lengths,
     _masked_mean,
