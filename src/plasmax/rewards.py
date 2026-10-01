@@ -2,8 +2,10 @@
 
 Registered rewards preserve their physical scores, then return squareplus on
 ordinary transitions and its logarithm on physical or solver termination.
-Invalid-state transitions return zero. Custom reward callables own their full
-return value and are not transformed by the environment.
+Invalid-state transitions return zero. ``P_diff_MW`` is the exception: it is
+the linear pre-squareplus reward and returns zero on every termination. Custom
+reward callables own their full return value and are not transformed by the
+environment.
 """
 
 import dataclasses
@@ -99,6 +101,24 @@ def P_diff(
     return _terminal_reward(
         score_scale * (fusion - auxiliary) * 1e-9, termination_code
     )
+
+
+def P_diff_MW(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+) -> jax.Array:
+    """Fusion power minus auxiliary heating power, in MW, without squareplus.
+
+    The pre-squareplus ``P_diff`` reward at 1000 times its GW scale: linear in
+    net power on ordinary transitions and zero on every termination (codes
+    1-4), as the environment's old zero terminal penalty gave."""
+    del state, action
+    fusion = _valid_input(next_state.plasma.P_fusion, termination_code)
+    auxiliary = _valid_input(next_state.plasma.P_aux_total, termination_code)
+    score = (fusion - auxiliary) * 1e-6
+    return jnp.where(termination_code == -1, score, jnp.zeros_like(score))
 
 
 def W_thermal(
@@ -242,6 +262,7 @@ _REWARD_ALIASES: dict[str, RewardFn] = {
     "Q_fusion": Q_fusion,
     "beta_N": beta_N,
     "P_diff": P_diff,
+    "P_diff_MW": P_diff_MW,
     "W_thermal": W_thermal,
     "rampdown": rampdown,
     "lh_transition": lh_transition,
