@@ -279,6 +279,53 @@ def _physics_metrics(traj, actuator_names):
     return metrics
 
 
+def _critic_metrics(algo, ts, traj):
+    """How well the critic predicts what actually happened in the eval rollouts.
+
+    - ``value_mean`` / ``target_mean``: whether the critic's *level* is right.
+    - ``explained_variance`` = 1 - Var(target - V) / Var(target): whether its
+      *shape* is. 1 = tracks every state-to-state difference, 0 = no better
+      than predicting one constant, < 0 = its differences are wrong.
+    """
+    reward = traj.reward
+    if algo.normalize_rewards:
+        reward = algo.normalize_rew(ts.rew_rms_state, reward)
+    reward = jnp.where(traj.valid, reward, 0.0)
+    ended = traj.terminated | traj.truncated
+
+    def discounted(future, step):
+        r, end = step
+        g = r + algo.gamma * jnp.where(end, 0.0, future)
+        return g, g
+
+    # Scan backwards over time (axis 1); the carry is one return per episode.
+    _, target = jax.lax.scan(
+        discounted,
+        jnp.zeros(reward.shape[0]),
+        (reward.T, ended.T),
+        reverse=True,
+    )
+    target = target.T
+
+    obs = traj.obs
+    if algo.normalize_observations:
+        obs = algo.normalize_obs(ts.obs_rms_state, obs)
+    flat = obs.reshape(-1, obs.shape[-1])
+    value = algo.critic.apply(ts.critic_ts.params, flat).reshape(target.shape)
+
+    mask = traj.valid
+    count = jnp.maximum(jnp.sum(mask), 1)
+    mean = lambda x: jnp.sum(jnp.where(mask, x, 0.0)) / count
+    var = lambda x: mean((x - mean(x)) ** 2)
+    target_var = var(target)
+    return {
+        "critic_eval/value_mean": mean(value),
+        "critic_eval/target_mean": mean(target),
+        "critic_eval/explained_variance": 1.0
+        - var(target - value) / jnp.maximum(target_var, 1e-12),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Eval callback
 # ---------------------------------------------------------------------------
@@ -305,7 +352,8 @@ def _make_logging_callback(
     (``obs_train/*``, read out of ``ts.env_state``) and for this checkpoint's
     own eval rollouts (``obs_eval/*``, computed from the eval trajectory),
     and the eval rollouts' true P_diff and applied actuator means
-    (``physics_eval/*``, ``actuators_eval/*``; see :func:`_physics_metrics`).
+    (``physics_eval/*``, ``actuators_eval/*``; see :func:`_physics_metrics`)
+    and critic accuracy on them (``critic_eval/*``; see :func:`_critic_metrics`).
     Routing through ``logger.log`` via ``jax.debug.callback`` means it
     appears live during training rather than only at the end. Each seed
     reports its own statistics (including its own SNR); the logger then
@@ -370,6 +418,7 @@ def _make_logging_callback(
                 )
             )
             metrics.update(_physics_metrics(traj, actuator_names))
+            metrics.update(_critic_metrics(algo, ts, traj))
             jax.debug.callback(logger.log, ts.global_step, run_idx, metrics)
             return episode_returns, episode_lengths
 
@@ -384,7 +433,7 @@ def _make_logging_callback(
 
 
 class _PDiffLogger(SeedBufferLogger):
-    """SeedBufferLogger that also prints the eval P_diff return at flush time.
+    """SeedBufferLogger that also prints eval P_diff and critic lines at flush time.
 
     Printing here (rather than from a separate debug callback) keeps the
     line adjacent to its own ``step=`` progress line instead of racing it -
@@ -406,6 +455,16 @@ class _PDiffLogger(SeedBufferLogger):
             print(
                 f"EVAL P_diff return = {np.mean(p_diff):.1f} ±{spread:.1f} GW·steps "
                 f"(mean {np.mean(p_diff / length):.4f} GW/step; across seeds)"
+            )
+            critic = {
+                k: np.asarray([per_seed[r][f"critic_eval/{k}"] for r in runs])
+                for k in ("value_mean", "target_mean", "explained_variance")
+            }
+            print(
+                f"EVAL critic: V mean = {np.mean(critic['value_mean']):.4g} vs "
+                f"target mean = {np.mean(critic['target_mean']):.4g}, "
+                f"explained variance = {np.mean(critic['explained_variance']):.3f} "
+                "(across seeds)"
             )
         super()._flush_step(step)
 
