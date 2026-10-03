@@ -13,7 +13,7 @@ from plasmax.wrappers import RealisticWrappers
 pytest.importorskip("rejax")
 
 from helpers import CheapBoundaryEnv, CheapBoundaryState
-from rejax.algos.ppo import PPO
+from rejax.algos.ppo import PPO, AdvantageMinibatch, Trajectory
 from rejax.networks import GaussianPolicy
 
 from agents.ppo import MultiDiscretePolicy, PPOAdapter
@@ -55,6 +55,68 @@ def test_adapter_uses_upstream_ppo_optimization():
     assert issubclass(PPOAdapter, PPO)
     assert "calculate_gae" not in PPOAdapter.__dict__
     assert "update" not in PPOAdapter.__dict__
+
+
+def _critic_step(algo: PPOAdapter, moved: float, target_gap: float = 5.0):
+    """Critic params after one update. The rollout's stored values sit
+    ``moved`` below the current predictions (as if earlier minibatches already
+    moved them) and the targets sit ``target_gap`` above the predictions."""
+    ts = algo.init_state(jax.random.PRNGKey(0))
+    obs = jax.random.normal(jax.random.PRNGKey(1), (16, 2))
+    value = algo.critic.apply(ts.critic_ts.params, obs)
+    zeros = jnp.zeros(16)
+    traj = Trajectory(obs, jnp.zeros((16, 1)), zeros, zeros, value - moved, zeros)
+    batch = AdvantageMinibatch(traj, zeros, value + target_gap)
+    return ts.critic_ts.params, algo.update_critic(ts, batch).critic_ts.params
+
+
+@pytest.mark.parametrize("moved", [0.05, 1.0], ids=("inside", "outside"))
+def test_value_clip_default_matches_upstream_rejax(moved):
+    env = TruncationWrapper(
+        CheapBoundaryEnv(obs_dim=2, action_low=(-1.0,), action_high=(1.0,)), max_steps=2
+    )
+    gymnax_env = EnvelopeGymnax(env)
+    kwargs = dict(
+        env=gymnax_env,
+        env_params=gymnax_env.default_params,
+        agent_kwargs={"activation": "swish", "hidden_layer_sizes": (64, 64)},
+    )
+    _, ours = _critic_step(PPOAdapter.create(**kwargs), moved)
+    _, upstream = _critic_step(PPO.create(**kwargs), moved)
+    jax.tree.map(np.testing.assert_allclose, ours, upstream)
+
+
+def test_value_clip_none_is_plain_squared_error():
+    env = TruncationWrapper(
+        CheapBoundaryEnv(obs_dim=2, action_low=(-1.0,), action_high=(1.0,)), max_steps=2
+    )
+    clipped = _make_algo(env, value_clip_eps=0.2)
+    unclipped = _make_algo(env, value_clip_eps=None)
+    huge_clip = _make_algo(env, value_clip_eps=1e9)
+    # Predictions already moved 1.0 past their stored values, beyond a 0.2
+    # clip: the clipped loss has zero gradient so the critic stays put, while
+    # no clip (or an unreachable one) keeps moving towards the targets.
+    before, p_clip = _critic_step(clipped, moved=1.0)
+    _, p_none = _critic_step(unclipped, moved=1.0)
+    _, p_huge = _critic_step(huge_clip, moved=1.0)
+    jax.tree.map(np.testing.assert_allclose, p_clip, before)
+    jax.tree.map(np.testing.assert_allclose, p_none, p_huge)
+    leaves = lambda p: jnp.concatenate([x.ravel() for x in jax.tree.leaves(p)])
+    assert not np.allclose(leaves(p_none), leaves(before))
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [([], 0.2), (["--ppo.value-clip-eps", "None"], None), (["--ppo.value-clip-eps", "10"], 10.0)],
+)
+def test_launcher_parses_value_clip_eps(args, expected) -> None:
+    from training import train_ppo
+
+    cfg = tyro.cli(train_ppo.Config, args=args)
+    assert cfg.ppo.value_clip_eps == expected
+    suffix = {0.2: None, None: "-novclip", 10.0: "-vclip10"}[expected]
+    name = train_ppo._run_name(cfg)
+    assert (suffix in name) if suffix else ("vclip" not in name)
 
 
 @pytest.mark.parametrize(

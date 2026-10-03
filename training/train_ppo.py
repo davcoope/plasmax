@@ -148,6 +148,7 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
+    value_clip_eps: float | None = 0.2
     vf_coef: float = 0.5
     ent_coef: float = 0.01
     max_grad_norm: float = 0.5
@@ -233,6 +234,10 @@ def _run_name(cfg: Config) -> str:
         name += f"-q{cfg.env.quantize_bins}"
     if cfg.env.reward_score_scale != 1.0:
         name += f"-rs{cfg.env.reward_score_scale:g}"
+    if cfg.ppo.value_clip_eps is None:
+        name += "-novclip"
+    elif cfg.ppo.value_clip_eps != 0.2:
+        name += f"-vclip{cfg.ppo.value_clip_eps:g}"
     if cfg.env.deterministic_eval:
         name += "-det_eval"
     if cfg.num_seeds > 1:
@@ -276,6 +281,7 @@ def _build_algo(cfg: Config, env):
         gamma=cfg.ppo.gamma,
         gae_lambda=cfg.ppo.gae_lambda,
         clip_eps=cfg.ppo.clip_eps,
+        value_clip_eps=cfg.ppo.value_clip_eps,
         vf_coef=cfg.ppo.vf_coef,
         ent_coef=cfg.ppo.ent_coef,
         max_grad_norm=cfg.ppo.max_grad_norm,

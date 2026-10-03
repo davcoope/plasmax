@@ -8,6 +8,7 @@ from dataclasses import fields
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax import struct
 from rejax.algos.ppo import PPO
 from rejax.networks import MLP, VNetwork
 
@@ -94,6 +95,10 @@ class MultiDiscretePolicy(nn.Module):
 class PPOAdapter(EnvelopeNormalizationMixin, PPO):
     """Upstream Rejax PPO with plasmax action-space and eval adapters."""
 
+    # Rejax reuses clip_eps for the value clip; this decouples it. The value
+    # clip is in absolute reward units. None disables it (plain squared error).
+    value_clip_eps: float | None = struct.field(pytree_node=False, default=0.2)
+
     @classmethod
     def create(cls, **config):
         callback = config.pop("eval_callback", None)
@@ -112,6 +117,23 @@ class PPOAdapter(EnvelopeNormalizationMixin, PPO):
             return callback(algo, train_state, rng, None)
 
         return self.replace(eval_callback=wrapped)
+
+    def update_critic(self, ts, batch):
+        """Rejax's critic update with ``value_clip_eps`` in place of ``clip_eps``."""
+
+        def critic_loss_fn(params):
+            value = self.critic.apply(params, batch.trajectories.obs)
+            value_losses = jnp.square(value - batch.targets)
+            if self.value_clip_eps is not None:
+                value_pred_clipped = batch.trajectories.value + (
+                    value - batch.trajectories.value
+                ).clip(-self.value_clip_eps, self.value_clip_eps)
+                value_losses_clipped = jnp.square(value_pred_clipped - batch.targets)
+                value_losses = jnp.maximum(value_losses, value_losses_clipped)
+            return self.vf_coef * 0.5 * value_losses.mean()
+
+        grads = jax.grad(critic_loss_fn)(ts.critic_ts.params)
+        return ts.replace(critic_ts=ts.critic_ts.apply_gradients(grads=grads))
 
     @classmethod
     def create_agent(cls, config, env, env_params):
