@@ -18,12 +18,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tyro
+import wandb
 from envelope import WrappedState, Wrapper, field, static_field
 
 from training.wandb_logging import (
-    _base_metrics,
     _collect_returns_and_lengths,
     _masked_mean,
+    evaluation_scalar_metrics,
 )
 from experiments.studies.baseline_study import seed_keys
 from plasmax.environment.factory import make
@@ -37,6 +38,7 @@ from plasmax.wrappers import (
     _training_wrappers,
     unwrap_to_env_state,
 )
+from training.runs import save_run_policies
 from training.train_ppo import Config, _build_algo, _reward_arg, _run_name
 from training.vmap_logging import SeedBufferLogger
 
@@ -306,9 +308,8 @@ def _make_logging_callback(
     (``physics_eval/*``, ``actuators_eval/*``; see :func:`_physics_metrics`).
     Routing through ``logger.log`` via ``jax.debug.callback`` means it
     appears live during training rather than only at the end. Each seed
-    reports its own statistics; :class:`_TableLogger` combines them across
-    seeds at flush time, which also keeps each table ordered with its
-    ``step=`` progress line.
+    reports its own statistics (including its own SNR); the logger then
+    reports the mean and spread across seeds, as it does for ``return``.
     """
 
     def for_run(run_idx):
@@ -322,8 +323,8 @@ def _make_logging_callback(
                 lean=True,
                 deterministic=deterministic,
             )
-            metrics = _base_metrics(
-                traj, episode_returns, episode_lengths, train_metrics
+            metrics = evaluation_scalar_metrics(
+                traj, episode_returns, episode_lengths, train_metrics, physics=True
             )
 
             # --- training bucket that just completed -------------------
@@ -382,95 +383,20 @@ def _make_logging_callback(
 # ---------------------------------------------------------------------------
 
 
-_HEADERS = (
-    ("sensor", "<18", "s"),
-    ("noise_rel_std", ">14", ".3f"),
-    ("obs_rms", ">12", ".4g"),
-    ("obs_std", ">12", ".4g"),
-    ("noise_std_at_1x", ">16", ".4g"),
-    ("snr_mean", ">12", ".3f"),
-    ("snr_std", ">12", ".3f"),
-)
+class _PDiffLogger(SeedBufferLogger):
+    """SeedBufferLogger that also prints the eval P_diff return at flush time.
 
-
-def _print_table(title: str, rows) -> None:
-    print(f"\n{title}")
-    print("".join(f"{name:{width}}" for name, width, _ in _HEADERS))
-    for row in rows:
-        print(
-            "".join(
-                f"{row[name]:{width}{fmt}}" if fmt != "s" else f"{row[name]:{width}}"
-                for name, width, fmt in _HEADERS
-            )
-        )
-
-
-class _TableLogger(SeedBufferLogger):
-    """SeedBufferLogger that also prints per-sensor tables at flush time.
-
-    Each seed is an independently trained policy, so its SNR is computed in
-    full before any cross-seed aggregation, and the table reports the mean
-    and spread of those per-seed SNRs - as ``return`` is reported, rather
-    than pooled as if the seeds were one population. The descriptive
-    columns beside it are plain seed means, so ``obs_std / noise_std`` as
-    printed will not exactly reproduce ``snr_mean``.
-
-    Printing here (rather than from a separate debug callback) keeps each
-    table adjacent to its own ``step=`` progress line instead of racing it -
+    Printing here (rather than from a separate debug callback) keeps the
+    line adjacent to its own ``step=`` progress line instead of racing it -
     ``jax.debug.callback`` ordering across a vmapped seed axis is not
-    guaranteed.
+    guaranteed. Per-sensor observation statistics go to W&B only.
     """
 
-    def __init__(self, *args, names, noise_cfg, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._names = names
-        self._noise_cfg = noise_cfg
-
-    def _rows(self, prefix, per_seed):
-        order = sorted(per_seed)
-
-        def seed_values(key):
-            return np.asarray([per_seed[r][key] for r in order], dtype=np.float64)
-
-        rows = []
-        for name in self._names:
-            key = f"{prefix}/{name}"
-            if f"{key}/snr" not in per_seed[order[0]]:
-                return None
-            snr = seed_values(f"{key}/snr")
-            with np.errstate(invalid="ignore"):
-                # nan once a seed is infinite, i.e. a sensor carrying no noise.
-                snr_std = float(np.std(snr, ddof=1)) if snr.size > 1 else float("nan")
-            rows.append(
-                {
-                    "sensor": name,
-                    "noise_rel_std": float(self._noise_cfg.get(name, 0.0)),
-                    "obs_rms": float(np.mean(seed_values(f"{key}/obs_rms"))),
-                    "obs_std": float(np.mean(seed_values(f"{key}/obs_std"))),
-                    "noise_std_at_1x": float(
-                        np.mean(seed_values(f"{key}/noise_std_at_1x"))
-                    ),
-                    "snr_mean": float(np.mean(snr)),
-                    "snr_std": snr_std,
-                }
-            )
-        return rows
-
     def _flush_step(self, step: int) -> None:
-        # Read the buffer before super() pops it, so the tables print above
+        # Read the buffer before super() pops it, so the line prints above
         # the step= line that super() emits.
         per_seed = self._buffers.get(step, {})
         if per_seed:
-            elapsed = time.time() - (self.start_time or time.time())
-            # At step 0 no training bucket has closed, so only eval is real.
-            if step > 0:
-                rows = self._rows("obs_train", per_seed)
-                if rows:
-                    _print_table(f"TRAIN bucket @ step {step:,}", rows)
-            rows = self._rows("obs_eval", per_seed)
-            if rows:
-                label = "pre-training" if step == 0 else f"step {step:,}"
-                _print_table(f"EVAL checkpoint @ {label} (t+{elapsed:.0f}s)", rows)
             runs = sorted(per_seed)
             p_diff = np.asarray([per_seed[r]["physics_eval/P_diff_return"] for r in runs])
             length = np.asarray(
@@ -481,7 +407,6 @@ class _TableLogger(SeedBufferLogger):
                 f"EVAL P_diff return = {np.mean(p_diff):.1f} ±{spread:.1f} GW·steps "
                 f"(mean {np.mean(p_diff / length):.4f} GW/step; across seeds)"
             )
-            print()
         super()._flush_step(step)
 
 
@@ -502,7 +427,7 @@ def main(cfg: Config) -> None:
     noise_cfg = env.plasmax_config.observations.realistic.noise
 
     run_name = f"{_run_name(cfg)}-obsstats"
-    logger = _TableLogger(
+    logger = _PDiffLogger(
         num_seeds=cfg.num_seeds,
         run_name=run_name,
         project=cfg.wandb.project,
@@ -514,8 +439,6 @@ def main(cfg: Config) -> None:
         seed_ids=tuple(range(cfg.seed, cfg.seed + cfg.num_seeds)),
         job_type=cfg.algorithm,
         tags=cfg.wandb.tags,
-        names=names,
-        noise_cfg=noise_cfg,
     )
 
     # Reuse train_ppo's builder so agent_kwargs/env_params/normalisation
@@ -562,8 +485,20 @@ def main(cfg: Config) -> None:
 
     logger.start_time = time.time()
     jax.block_until_ready(jax.jit(jax.vmap(pre_eval))(seeds, run_idxs))
-    ts, _ = train_fn(seeds, run_idxs)
-    jax.block_until_ready(ts)
+    ts, results = train_fn(seeds, run_idxs)
+    jax.block_until_ready((ts, results))
+    jax.effects_barrier()
+
+    if cfg.save_policy:
+        checkpoints = save_run_policies(
+            algo, ts, cfg, run_name, batched=True, results=results
+        )
+        if checkpoints:
+            artifact = wandb.Artifact(run_name, type="model")
+            for checkpoint in checkpoints:
+                artifact.add_file(str(checkpoint))
+                print(f"Saved checkpoint to {checkpoint}", flush=True)
+            logger.log_artifact(artifact)
 
     logger.finish()
 
