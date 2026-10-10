@@ -1,14 +1,15 @@
 """TORAX rewards and their termination behavior.
 
-Registered rewards preserve their physical scores, then return squareplus on
-ordinary transitions and its logarithm on physical or solver termination.
-Invalid-state transitions return zero. ``P_diff_MW`` is the exception: it is
-the linear pre-squareplus reward and returns zero on every termination. Custom
-reward callables own their full return value and are not transformed by the
-environment.
+Registered rewards compute a physical score, multiply it by ``scale``, then by
+default return squareplus on ordinary transitions and its logarithm on
+physical or solver termination. With ``squareplus=False`` they return the
+linear scaled score instead, and zero on every termination. Invalid-state
+transitions return zero either way. Custom reward callables own their full
+return value and are not transformed by the environment.
 """
 
 import dataclasses
+import functools
 from collections.abc import Callable
 
 import jax
@@ -47,6 +48,33 @@ def _terminal_reward(score: jax.Array, termination_code: jax.Array) -> jax.Array
     return jnp.where(termination_code == 4, jnp.zeros_like(reward), reward)
 
 
+def _registered(score: RewardFn) -> RewardFn:
+    """Turn a physical score into a registered reward.
+
+    The reward takes keyword-only ``squareplus`` (default True) and ``scale``
+    (default 1); bind them with ``functools.partial``. Further keywords pass
+    through to ``score``.
+    """
+
+    @functools.wraps(score)
+    def reward(
+        state: EnvState,
+        action: jax.Array,
+        next_state: EnvState,
+        termination_code: jax.Array,
+        *,
+        squareplus: bool = True,
+        scale: float = 1.0,
+        **kwargs,
+    ) -> jax.Array:
+        value = scale * score(state, action, next_state, termination_code, **kwargs)
+        if squareplus:
+            return _terminal_reward(value, termination_code)
+        return jnp.where(termination_code == -1, value, jnp.zeros_like(value))
+
+    return reward
+
+
 def _safe_barrier_state(next_state: EnvState, termination_code: jax.Array) -> EnvState:
     """Keep q reductions and their VJPs defined on invalid vmapped lanes."""
     core = dataclasses.replace(
@@ -61,6 +89,7 @@ def _safe_barrier_state(next_state: EnvState, termination_code: jax.Array) -> En
     )
 
 
+@_registered
 def Q_fusion(
     state: EnvState,
     action: jax.Array,
@@ -69,9 +98,10 @@ def Q_fusion(
 ) -> jax.Array:
     """Fusion power gain (~10 at Q=10). Prone to reward hacking at low power."""
     del state, action
-    return _terminal_reward(next_state.plasma.Q_fusion, termination_code)
+    return next_state.plasma.Q_fusion
 
 
+@_registered
 def beta_N(
     state: EnvState,
     action: jax.Array,
@@ -80,47 +110,24 @@ def beta_N(
 ) -> jax.Array:
     """Normalised toroidal beta (~2)."""
     del state, action
-    return _terminal_reward(next_state.plasma.beta_N, termination_code)
+    return next_state.plasma.beta_N
 
 
+@_registered
 def P_diff(
     state: EnvState,
     action: jax.Array,
     next_state: EnvState,
     termination_code: jax.Array,
-    *,
-    score_scale: float = 1.0,
 ) -> jax.Array:
-    """Fusion power minus auxiliary heating power, in GW, times ``score_scale``.
-
-    ``score_scale`` > 1 amplifies P_diff relative to squareplus's ~1/step
-    survival utility; bind it with ``functools.partial``."""
+    """Fusion power minus auxiliary heating power, in GW."""
     del state, action
     fusion = _valid_input(next_state.plasma.P_fusion, termination_code)
     auxiliary = _valid_input(next_state.plasma.P_aux_total, termination_code)
-    return _terminal_reward(
-        score_scale * (fusion - auxiliary) * 1e-9, termination_code
-    )
+    return (fusion - auxiliary) * 1e-9
 
 
-def P_diff_MW(
-    state: EnvState,
-    action: jax.Array,
-    next_state: EnvState,
-    termination_code: jax.Array,
-) -> jax.Array:
-    """Fusion power minus auxiliary heating power, in MW, without squareplus.
-
-    The pre-squareplus ``P_diff`` reward at 1000 times its GW scale: linear in
-    net power on ordinary transitions and zero on every termination (codes
-    1-4), as the environment's old zero terminal penalty gave."""
-    del state, action
-    fusion = _valid_input(next_state.plasma.P_fusion, termination_code)
-    auxiliary = _valid_input(next_state.plasma.P_aux_total, termination_code)
-    score = (fusion - auxiliary) * 1e-6
-    return jnp.where(termination_code == -1, score, jnp.zeros_like(score))
-
-
+@_registered
 def W_thermal(
     state: EnvState,
     action: jax.Array,
@@ -133,7 +140,7 @@ def W_thermal(
     cold ramp-up pays off immediately instead of reading as pure cost."""
     del state, action
     thermal = _valid_input(next_state.plasma.W_thermal_total, termination_code)
-    return _terminal_reward(thermal * 1e-8, termination_code)
+    return thermal * 1e-8
 
 
 def soft_barrier(
@@ -178,6 +185,7 @@ _RAMPDOWN_BARRIERS: tuple[RewardFn, ...] = (
 )
 
 
+@_registered
 def rampdown(
     state: EnvState,
     action: jax.Array,
@@ -192,12 +200,11 @@ def rampdown(
     So there is no current-progress term to reward: the agent can only steer the
     heating/fuelling actuators to hold the plasma safe (Greenwald / li / q_min /
     beta_N barriers) as the current is brought down externally. The physical
-    score sums log-sigmoid barriers and is near zero inside every limit. Its
-    positive reward is near one; termination returns the logarithm of it.
+    score sums log-sigmoid barriers and is near zero inside every limit.
     """
     next_state = _safe_barrier_state(next_state, termination_code)
     args = (state, action, next_state, termination_code)
-    return _terminal_reward(sum(b(*args) for b in _RAMPDOWN_BARRIERS), termination_code)
+    return sum(b(*args) for b in _RAMPDOWN_BARRIERS)
 
 
 _RAMPUP_LH_BARRIERS: tuple[RewardFn, ...] = (
@@ -209,6 +216,7 @@ _RAMPUP_LH_BARRIERS: tuple[RewardFn, ...] = (
 )
 
 
+@_registered
 def lh_transition(
     state: EnvState,
     action: jax.Array,
@@ -249,20 +257,18 @@ def lh_transition(
     h_bonus = jnp.where(mode == Mode.H_MODE, 1.0, 0.0)
     back = jnp.where(mode == Mode.TRANSITIONING_TO_L_MODE, 1.0, 0.0)
 
-    score = (
+    return (
         ratio * t_frac**2
         + h_bonus * t_frac
         - 2.0 * back
         + sum(b(*args) for b in _RAMPUP_LH_BARRIERS)
     )
-    return _terminal_reward(score, termination_code)
 
 
 _REWARD_ALIASES: dict[str, RewardFn] = {
     "Q_fusion": Q_fusion,
     "beta_N": beta_N,
     "P_diff": P_diff,
-    "P_diff_MW": P_diff_MW,
     "W_thermal": W_thermal,
     "rampdown": rampdown,
     "lh_transition": lh_transition,

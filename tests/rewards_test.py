@@ -7,6 +7,7 @@ operation, and own their terminal behavior. Custom callables pass through.
 """
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -74,30 +75,6 @@ class NamedRewardsTest:
             rtol=0.0,
         )
 
-    def test_P_diff_score_scale_multiplies_score_before_squareplus(self):
-        scale = 10.0
-        score = scale * (
-            (self._state.plasma.P_fusion - self._state.plasma.P_aux_total) * 1e-9
-        )
-        np.testing.assert_allclose(
-            rewards_lib.P_diff(
-                self._state, self._action, self._state, jnp.int32(-1),
-                score_scale=scale,
-            ),
-            _positive_reference(score),
-            atol=1e-6,
-            rtol=0.0,
-        )
-        np.testing.assert_allclose(
-            rewards_lib.P_diff(
-                self._state, self._action, self._state, jnp.int32(1),
-                score_scale=scale,
-            ),
-            np.log(_positive_reference(score)),
-            atol=1e-6,
-            rtol=0.0,
-        )
-
     def test_P_diff_below_unit_baseline_when_fusion_below_aux(self):
         # Independent semantic check (the expression test above mirrors the
         # implementation, so it cannot catch a wrong sign or unit scale).
@@ -116,8 +93,8 @@ class NamedRewardsTest:
         )
 
 
-class PDiffMWRewardTest:
-    """Linear pre-squareplus net power in MW, zero on every termination."""
+class LinearPDiffRewardTest:
+    """Without squareplus, P_diff is signed net power, zero on every termination."""
 
     @classmethod
     def setup_class(cls) -> None:
@@ -126,33 +103,71 @@ class PDiffMWRewardTest:
         cls._loss = _with_postout(state, P_fusion=100e6, P_aux_total=500e6)
 
     @staticmethod
-    def _reward(state: EnvState) -> jax.Array:
-        return rewards_lib.P_diff_MW(state, state.prev_action, state, jnp.int32(-1))
+    def _megawatts(state: EnvState, code: int | jax.Array = -1) -> jax.Array:
+        return rewards_lib.P_diff(
+            state, state.prev_action, state, jnp.asarray(code), squareplus=False,
+            scale=1e3,
+        )
 
     def test_ordinary_transition_is_signed_net_power_in_megawatts(self) -> None:
         # Explicit powers pin the sign and unit scale; a net loss stays
         # negative rather than being squashed positive as squareplus would.
-        np.testing.assert_allclose(self._reward(self._gain), 400.0, rtol=1e-6)
-        np.testing.assert_allclose(self._reward(self._loss), -400.0, rtol=1e-6)
-
-    def test_is_thousand_times_the_gigawatt_P_diff_score(self) -> None:
-        utility = rewards_lib.P_diff(
-            self._gain, self._gain.prev_action, self._gain, jnp.int32(-1)
-        )
-        # Invert squareplus to recover the GW score that P_diff transforms.
-        gigawatt_score = utility - 1.0 / utility
-        np.testing.assert_allclose(
-            self._reward(self._gain), 1000.0 * gigawatt_score, rtol=1e-5, atol=0.0
-        )
+        np.testing.assert_allclose(self._megawatts(self._gain), 400.0, rtol=1e-6)
+        np.testing.assert_allclose(self._megawatts(self._loss), -400.0, rtol=1e-6)
 
     def test_every_termination_returns_zero(self) -> None:
+        values = jax.jit(jax.vmap(lambda c: self._megawatts(self._gain, c)))(
+            jnp.asarray([-1, 1, 2, 3, 4])
+        )
+        np.testing.assert_allclose(values[0], 400.0, rtol=1e-6)
+        np.testing.assert_array_equal(values[1:], np.zeros(4))
+
+
+class RewardTransformTest:
+    """``scale`` multiplies the score; ``squareplus`` toggles the transform."""
+
+    @classmethod
+    def setup_class(cls) -> None:
+        cls._state = _make_env_state()
+
+    def _at_codes(self, reward, **kwargs) -> jax.Array:
         def at_code(code: jax.Array) -> jax.Array:
-            return rewards_lib.P_diff_MW(
-                self._gain, self._gain.prev_action, self._gain, code
+            return reward(
+                self._state, self._state.prev_action, self._state, code, **kwargs
             )
 
-        values = jax.jit(jax.vmap(at_code))(jnp.asarray([-1, 1, 2, 3, 4]))
-        np.testing.assert_allclose(values[0], 400.0, rtol=1e-6)
+        return jax.jit(jax.vmap(at_code))(jnp.asarray([-1, 1, 2, 3, 4]))
+
+    @pytest.mark.parametrize("reward", _NAMED_REWARDS)
+    def test_default_is_squareplus_of_the_linear_score(
+        self, reward: rewards_lib.RewardFn
+    ) -> None:
+        score = self._at_codes(reward, squareplus=False)[0]
+        np.testing.assert_allclose(
+            self._at_codes(reward)[0], _positive_reference(score), rtol=1e-5
+        )
+
+    @pytest.mark.parametrize("reward", _NAMED_REWARDS)
+    def test_scale_multiplies_score_inside_squareplus(
+        self, reward: rewards_lib.RewardFn
+    ) -> None:
+        scale = 10.0
+        score = self._at_codes(reward, squareplus=False)[0]
+        values = self._at_codes(reward, scale=scale)
+        utility = _positive_reference(scale * score)
+        np.testing.assert_allclose(values[0], utility, rtol=1e-5)
+        np.testing.assert_allclose(
+            values[1:4], np.full(3, np.log(utility)), rtol=1e-5, atol=1e-6
+        )
+        assert values[4] == 0.0
+
+    @pytest.mark.parametrize("reward", _NAMED_REWARDS)
+    def test_linear_scale_multiplies_score_and_zeroes_terminations(
+        self, reward: rewards_lib.RewardFn
+    ) -> None:
+        score = self._at_codes(reward, squareplus=False)[0]
+        values = self._at_codes(reward, squareplus=False, scale=-3.0)
+        np.testing.assert_allclose(values[0], -3.0 * score, rtol=1e-6)
         np.testing.assert_array_equal(values[1:], np.zeros(4))
 
 
@@ -175,7 +190,13 @@ class TerminalRewardTest:
         )
         assert np.all(values[1:] < values[0])
 
-    @pytest.mark.parametrize("reward", (*_NAMED_REWARDS, rewards_lib.P_diff_MW))
+    @pytest.mark.parametrize(
+        "reward",
+        (
+            *_NAMED_REWARDS,
+            *(functools.partial(r, squareplus=False) for r in _NAMED_REWARDS),
+        ),
+    )
     def test_invalid_state_inputs_have_zero_reward_and_gradient_under_vmap(
         self, reward: rewards_lib.RewardFn
     ) -> None:
@@ -483,7 +504,6 @@ class ResolveRewardFnTest:
         assert rewards_lib.resolve_reward_fn("Q_fusion") is rewards_lib.Q_fusion
         assert rewards_lib.resolve_reward_fn("beta_N") is rewards_lib.beta_N
         assert rewards_lib.resolve_reward_fn("P_diff") is rewards_lib.P_diff
-        assert rewards_lib.resolve_reward_fn("P_diff_MW") is rewards_lib.P_diff_MW
 
     def test_passes_through_callable(self):
         def fn(state, action, next_state, termination_code):

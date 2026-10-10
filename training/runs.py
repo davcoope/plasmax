@@ -104,7 +104,13 @@ def load_policy_env(
     if task == "kstar_worldmodel":
         reward = None
     env = wrappers(
-        make(task, selected_backend, reward=reward),
+        make(
+            task,
+            selected_backend,
+            reward=reward,
+            squareplus=recorded.get("squareplus", True),
+            reward_scale=recorded.get("reward_score_scale", 1.0),
+        ),
         **options,
     )
     check_interfaces(policy, env)

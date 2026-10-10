@@ -87,6 +87,8 @@ class PublicApiTest:
             "env",
             "backend",
             "reward",
+            "squareplus",
+            "reward_scale",
         )
         assert (
             signature.parameters["env"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD

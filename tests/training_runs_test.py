@@ -482,9 +482,40 @@ def test_environment_reconstruction_preserves_reward_and_source_clock(
         metadata["effective_task"] = {"reward": effective}
     policy = LoadedPolicy("ppo", {}, environment_interface(env), metadata, True)
     assert runs.load_policy_env(policy) is env
-    assert calls[0][1] == {"reward": expected}
+    assert calls[0][1] == {
+        "reward": expected,
+        "squareplus": True,
+        "reward_scale": 1.0,
+    }
     assert calls[1]["time_aware"] is True
     assert calls[1]["max_steps"] == 2
+
+
+def test_environment_reconstruction_preserves_reward_transform(monkeypatch):
+    env = _env()
+    calls = []
+
+    def make(*args, **kwargs):
+        calls.append(kwargs)
+        return env
+
+    monkeypatch.setattr(runs, "make", make)
+    monkeypatch.setattr(runs, "RealisticWrappers", lambda env, **kwargs: env)
+    metadata = {
+        "config": {
+            "env": {
+                "env_setup": "mock/circular/smoke",
+                "backend": "mock",
+                "reward": "P_diff",
+                "squareplus": False,
+                "reward_score_scale": 10.0,
+            }
+        },
+        "source_max_steps": 2,
+    }
+    policy = LoadedPolicy("ppo", {}, environment_interface(env), metadata, True)
+    runs.load_policy_env(policy)
+    assert calls[0] == {"reward": "P_diff", "squareplus": False, "reward_scale": 10.0}
 
 
 def test_reconstruction_rejects_changed_history_or_observation_layout(monkeypatch):

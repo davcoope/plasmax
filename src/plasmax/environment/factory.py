@@ -22,16 +22,21 @@ def _validate_options(
     env: str,
     backend: str | None,
     reward: str | rewards_lib.RewardFn | None,
+    transformed: bool,
 ) -> None:
     """Reject public-input errors before loading assets or constructing TORAX."""
     validate_env_backend(env, backend)
 
     if env == "kstar_worldmodel":
-        if reward is not None:
+        if reward is not None or transformed:
             raise ValueError("world-model environments use their native reward")
     else:
         if reward is not None:
             rewards_lib.resolve_reward_fn(reward)
+        if transformed and callable(reward):
+            raise ValueError(
+                "squareplus and reward_scale apply only to registered rewards"
+            )
 
 
 def _load_world_model_env(cfg: WorldModelConfig) -> Environment:
@@ -51,6 +56,8 @@ def _build_env(
     cfg: PlasmaxConfig,
     *,
     reward: str | rewards_lib.RewardFn | None,
+    squareplus: bool = True,
+    reward_scale: float = 1.0,
 ) -> Environment:
     """Build the bare environment from a validated configuration."""
     resolved_reward = cfg.task.reward if reward is None else reward
@@ -63,6 +70,10 @@ def _build_env(
         reward_fn = functools.partial(
             rewards_lib.lh_transition,
             t_final=float(cfg.torax.numerics.t_final),
+        )
+    if not squareplus or reward_scale != 1.0:
+        reward_fn = functools.partial(
+            reward_fn, squareplus=squareplus, scale=reward_scale
         )
     phase_snapshot = initialization_lib.snapshot_from_initialization(cfg._initial_state)
 
@@ -95,6 +106,8 @@ def make(
     backend: str | None = None,
     *,
     reward: str | rewards_lib.RewardFn | None = None,
+    squareplus: bool = True,
+    reward_scale: float = 1.0,
 ) -> Environment:
     """Build a bare environment from registry aliases.
 
@@ -102,12 +115,18 @@ def make(
     for example ``RealisticWrappers(make(env, backend), max_steps=100)``.
     A custom reward receives ``(state, action, next_state, termination_code)``
     and returns the final scalar reward, which is cast to float32.
+    ``squareplus`` and ``reward_scale`` configure a registered reward: its
+    score is multiplied by ``reward_scale``, then passed through squareplus or,
+    if ``squareplus=False``, returned linearly with zero on termination.
     """
-    _validate_options(env, backend, reward)
+    transformed = not squareplus or reward_scale != 1.0
+    _validate_options(env, backend, reward, transformed)
     cfg = parse_env_and_backend(env, backend)
     if isinstance(cfg, WorldModelConfig):
         return _load_world_model_env(cfg)
-    return _build_env(cfg, reward=reward)
+    return _build_env(
+        cfg, reward=reward, squareplus=squareplus, reward_scale=reward_scale
+    )
 
 
 __all__ = ["make"]

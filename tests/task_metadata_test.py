@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -76,6 +77,32 @@ def test_string_and_callable_reward_overrides_are_preserved():
         reward=custom_reward,
     )
     assert callable_env.unwrapped._dynamics._reward_fn is custom_reward
+
+
+def test_squareplus_and_reward_scale_bind_onto_the_registered_reward():
+    env = make(_MOCK_ENV, _MOCK_BACKEND, squareplus=False, reward_scale=10.0)
+    reward_fn = env.unwrapped._dynamics._reward_fn
+    assert isinstance(reward_fn, functools.partial)
+    assert reward_fn.func is rewards.P_diff
+    assert reward_fn.keywords == {"squareplus": False, "scale": 10.0}
+
+
+def test_reward_transform_keeps_lh_transition_rampup_duration():
+    env = make("sparc/prd/rampup", "bohm_gyrobohm", reward_scale=2.0)
+    reward_fn = env.unwrapped._dynamics._reward_fn
+    assert reward_fn.func is rewards.lh_transition
+    assert reward_fn.keywords == {"t_final": 10.0, "squareplus": True, "scale": 2.0}
+
+
+def test_reward_transform_rejects_custom_and_native_rewards():
+    def custom_reward(state, action, next_state, termination_code):
+        del state, action, next_state, termination_code
+        return jnp.float32(7.0)
+
+    with pytest.raises(ValueError, match="registered rewards"):
+        make(_MOCK_ENV, _MOCK_BACKEND, reward=custom_reward, squareplus=False)
+    with pytest.raises(ValueError, match="native reward"):
+        make("kstar_worldmodel", reward_scale=2.0)
 
 
 def test_phase_defaults_are_available_without_duplicated_reward_maps():

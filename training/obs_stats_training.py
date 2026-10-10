@@ -39,7 +39,7 @@ from plasmax.wrappers import (
     unwrap_to_env_state,
 )
 from training.runs import save_run_policies
-from training.train_ppo import Config, _build_algo, _reward_arg, _run_name
+from training.train_ppo import Config, _build_algo, _run_name
 from training.vmap_logging import SeedBufferLogger
 
 # ---------------------------------------------------------------------------
@@ -221,7 +221,9 @@ def _build_env(cfg: Config, bucket_size: int, n_buckets: int):
     env = make(
         cfg.env.env_setup,
         cfg.env.backend,
-        reward=_reward_arg(cfg),
+        reward=cfg.env.reward,
+        squareplus=cfg.env.squareplus,
+        reward_scale=cfg.env.reward_score_scale,
     )
     plasmax_cfg = env.plasmax_config
     if plasmax_cfg.physics_randomization:

@@ -99,6 +99,8 @@ task:
 
 Omitting `reward` uses the task default; built-in TORAX rewards apply squareplus
 normally, its logarithm on disruption or solver failure, and zero on invalid state.
+`make(..., reward_scale=s)` multiplies the score inside squareplus, and
+`squareplus=False` returns the linear scaled score, zero on every termination.
 
 ```python
 env = RealisticWrappers(plasmax.make("iter/advanced/rampup", backend="qlknn"))
