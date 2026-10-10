@@ -10,6 +10,7 @@ policy, unlike the zero/random-action proxies in
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import operator
 import time
@@ -260,18 +261,19 @@ def _sensor_slices(env):
     return layout, names
 
 
-def _physics_metrics(traj, actuator_names):
-    """Eval P_diff return (GW summed over steps) and mean applied actuators (MW).
+def _physics_metrics(traj, actuator_names, score_name, score_fn):
+    """Eval score return and mean applied actuators (MW).
 
-    P_diff return is the per-episode sum of unscaled P_diff, averaged over eval
-    episodes.
+    Score return is the per-episode sum of the reward's raw score (no
+    squareplus, unscaled, zero on termination), averaged over eval episodes.
     """
     env_state = unwrap_to_env_state(traj.env_state)
-    plasma = env_state.plasma
-    live = traj.info.termination_code == -1
-    p_diff = jnp.where(live, (plasma.P_fusion - plasma.P_aux_total) * 1e-9, 0.0)
-    p_diff_return = jnp.sum(jnp.where(traj.valid, p_diff, 0.0), axis=1).mean()
-    metrics = {"physics_eval/P_diff_return": p_diff_return}
+    # Registered rewards score only the post-step state.
+    score = jax.vmap(jax.vmap(lambda s, c: score_fn(None, None, s, c)))(
+        env_state, traj.info.termination_code
+    )
+    score_return = jnp.sum(jnp.where(traj.valid, score, 0.0), axis=1).mean()
+    metrics = {f"physics_eval/{score_name}_return": score_return}
     applied = _masked_mean(env_state.prev_action, traj.valid)
     for i, name in enumerate(actuator_names):
         if name.startswith("P_"):
@@ -340,6 +342,8 @@ def _make_logging_callback(
     names,
     noise_cfg,
     actuator_names,
+    score_name,
+    score_fn,
     bucket_size,
     n_buckets,
     num_steps,
@@ -353,7 +357,7 @@ def _make_logging_callback(
     observation statistics for the training bucket that just finished
     (``obs_train/*``, read out of ``ts.env_state``) and for this checkpoint's
     own eval rollouts (``obs_eval/*``, computed from the eval trajectory),
-    and the eval rollouts' true P_diff and applied actuator means
+    and the eval rollouts' raw reward score and applied actuator means
     (``physics_eval/*``, ``actuators_eval/*``; see :func:`_physics_metrics`)
     and critic accuracy on them (``critic_eval/*``; see :func:`_critic_metrics`).
     Routing through ``logger.log`` via ``jax.debug.callback`` means it
@@ -419,7 +423,9 @@ def _make_logging_callback(
                     eval_m2,
                 )
             )
-            metrics.update(_physics_metrics(traj, actuator_names))
+            metrics.update(
+                _physics_metrics(traj, actuator_names, score_name, score_fn)
+            )
             metrics.update(_critic_metrics(algo, ts, traj))
             jax.debug.callback(logger.log, ts.global_step, run_idx, metrics)
             return episode_returns, episode_lengths
@@ -434,8 +440,8 @@ def _make_logging_callback(
 # ---------------------------------------------------------------------------
 
 
-class _PDiffLogger(SeedBufferLogger):
-    """SeedBufferLogger that also prints eval P_diff and critic lines at flush time.
+class _EvalLogger(SeedBufferLogger):
+    """SeedBufferLogger that also prints eval score and critic lines at flush time.
 
     Printing here (rather than from a separate debug callback) keeps the
     line adjacent to its own ``step=`` progress line instead of racing it -
@@ -443,20 +449,26 @@ class _PDiffLogger(SeedBufferLogger):
     guaranteed. Per-sensor observation statistics go to W&B only.
     """
 
+    def __init__(self, *, score_name: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.score_name = score_name
+
     def _flush_step(self, step: int) -> None:
         # Read the buffer before super() pops it, so the line prints above
         # the step= line that super() emits.
         per_seed = self._buffers.get(step, {})
         if per_seed:
             runs = sorted(per_seed)
-            p_diff = np.asarray([per_seed[r]["physics_eval/P_diff_return"] for r in runs])
+            key = f"physics_eval/{self.score_name}_return"
+            score = np.asarray([per_seed[r][key] for r in runs])
             length = np.asarray(
                 [per_seed[r]["evaluation/episode_length_mean"] for r in runs]
             )
-            spread = float(np.std(p_diff, ddof=1)) if p_diff.size > 1 else 0.0
+            spread = float(np.std(score, ddof=1)) if score.size > 1 else 0.0
             print(
-                f"EVAL P_diff return = {np.mean(p_diff):.1f} ±{spread:.1f} GW·steps "
-                f"(mean {np.mean(p_diff / length):.4f} GW/step; across seeds)"
+                f"EVAL {self.score_name} return = {np.mean(score):.4g} "
+                f"±{spread:.2g} (mean {np.mean(score / length):.4g}/step; "
+                "across seeds)"
             )
             critic = {
                 k: np.asarray([per_seed[r][f"critic_eval/{k}"] for r in runs])
@@ -486,9 +498,16 @@ def main(cfg: Config) -> None:
     env = _build_env(cfg, bucket_size, n_buckets)
     layout, names = _sensor_slices(env)
     noise_cfg = env.plasmax_config.observations.realistic.noise
+    score_name = cfg.env.reward or env.plasmax_config.task.reward
+    # The env's own reward (with any scenario binding, e.g. lh_transition's
+    # t_final) reduced to its raw score.
+    score_fn = functools.partial(
+        env.unwrapped._dynamics._reward_fn, squareplus=False, scale=1.0
+    )
 
     run_name = f"{_run_name(cfg)}-obsstats"
-    logger = _PDiffLogger(
+    logger = _EvalLogger(
+        score_name=score_name,
         num_seeds=cfg.num_seeds,
         run_name=run_name,
         project=cfg.wandb.project,
@@ -511,6 +530,8 @@ def main(cfg: Config) -> None:
         names=names,
         noise_cfg=noise_cfg,
         actuator_names=[spec.name for spec in env.actuator_specs],
+        score_name=score_name,
+        score_fn=score_fn,
         bucket_size=bucket_size,
         n_buckets=n_buckets,
         num_steps=algo.env_params.max_steps_in_episode,
