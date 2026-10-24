@@ -128,6 +128,22 @@ def P_diff(
 
 
 @_registered
+def P_diff_MW(
+    state: EnvState,
+    action: jax.Array,
+    next_state: EnvState,
+    termination_code: jax.Array,
+) -> jax.Array:
+    """Fusion power minus auxiliary heating power, in MW.
+
+    Equal to ``P_diff`` with ``scale=1000``."""
+    del state, action
+    fusion = _valid_input(next_state.plasma.P_fusion, termination_code)
+    auxiliary = _valid_input(next_state.plasma.P_aux_total, termination_code)
+    return (fusion - auxiliary) * 1e-6
+
+
+@_registered
 def W_thermal(
     state: EnvState,
     action: jax.Array,
@@ -269,6 +285,7 @@ _REWARD_ALIASES: dict[str, RewardFn] = {
     "Q_fusion": Q_fusion,
     "beta_N": beta_N,
     "P_diff": P_diff,
+    "P_diff_MW": P_diff_MW,
     "W_thermal": W_thermal,
     "rampdown": rampdown,
     "lh_transition": lh_transition,
