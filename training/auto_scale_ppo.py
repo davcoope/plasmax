@@ -5,7 +5,9 @@ training, this script rolls out each seed's untrained policy and sets
 ``s = target / quantile(|x|, coverage)``: by default 90% of initial-policy
 scores land in [-2, 2], where squareplus turns from its ~1/step survival floor
 into its linear regime. Rewards are normalised by default. Passing
-``--env.reward-score-scale`` skips calibration and uses that value instead.
+``--env.reward-score-scale`` skips calibration and uses that value instead;
+``--calib.policy PATH [PATH ...]`` calibrates from saved policies' rollouts
+instead of the untrained policy's.
 
 Training otherwise matches ``train_ppo.py``'s vmapped path (used for
 ``--num-seeds 1`` too, so there are no single-seed Plotly figures), with extra
@@ -27,10 +29,13 @@ import numpy as np
 import tyro
 import wandb
 
+from agents.policy_io import load_policy
 from experiments.studies.baseline_study import seed_keys
+from plasmax.rollout import collect_episodes
 from plasmax.wrappers import unwrap_to_env_state
 from training import train_ppo, wandb_logging
-from training.evaluation import write_transfer_summary
+from training.envelope_gymnax import to_typed_key
+from training.evaluation import check_interfaces, write_transfer_summary
 from training.runs import evaluate_transfer, save_run_policies, validate_seeds
 from training.train_ppo import (
     Config,
@@ -87,12 +92,14 @@ class AutoScaleEnvConfig(EnvConfig):
 
 @dataclasses.dataclass
 class CalibConfig:
-    # |s * score| at the coverage quantile of initial-policy scores.
+    # |s * score| at the coverage quantile of calibration scores.
     target: float = 2.0
-    # Fraction of initial-policy scores scaled into [-target, target].
+    # Fraction of calibration scores scaled into [-target, target].
     coverage: float = 0.9
-    # Initial-policy episodes per seed.
+    # Calibration episodes per seed (or per saved policy).
     n_envs: int = 32
+    # Saved .msgpack policies to calibrate from; None = the initial policy.
+    policy: tuple[str, ...] | None = None
 
 
 @dataclasses.dataclass
@@ -112,8 +119,9 @@ class _Label(str):
 
 
 def _auto_run_name(cfg: AutoScaleConfig) -> str:
-    """train_ppo's run name with ``-rsauto`` in place of ``-rs{s}``."""
-    label = "auto"
+    """train_ppo's run name with ``-rsauto`` (``-rsauto-pol`` when calibrated
+    from saved policies) in place of ``-rs{s}``."""
+    label = "auto-pol" if cfg.calib.policy else "auto"
     defaults = CalibConfig()
     if cfg.calib.target != defaults.target:
         label += f"-t{cfg.calib.target:g}"
@@ -146,12 +154,8 @@ def _raw_scores(traj, score_fn):
     )
 
 
-def _calibrate(cfg: AutoScaleConfig, env, score_fn) -> tuple[float, dict]:
-    """``(s, summary)`` from rollouts of every seed's untrained policy.
-
-    Uses the scores of ordinary (non-terminal) steps, pooled over seeds: the
-    vmapped seeds share one env, so they share one ``s``.
-    """
+def _initial_policy_scores(cfg: AutoScaleConfig, env, score_fn) -> np.ndarray:
+    """Ordinary-step raw scores from rollouts of every seed's untrained policy."""
     algo = _build_algo(cfg, env)
     num_steps = algo.env_params.max_steps_in_episode
 
@@ -165,7 +169,73 @@ def _calibrate(cfg: AutoScaleConfig, env, score_fn) -> tuple[float, dict]:
         return _raw_scores(traj, score_fn), ordinary
 
     scores, ordinary = jax.jit(jax.vmap(rollout))(seed_keys(cfg.seed, cfg.num_seeds))
-    scores = np.asarray(scores)[np.asarray(ordinary)]
+    return np.asarray(scores)[np.asarray(ordinary)]
+
+
+def _saved_policy_scores(
+    cfg: AutoScaleConfig, env, score_fn
+) -> tuple[np.ndarray, list[str]]:
+    """Ordinary-step raw scores from stochastic rollouts of each saved policy in
+    ``cfg.calib.policy``, plus the policies' run names.
+
+    Each policy acts with its own saved observation normalisation. A policy
+    trained on another ``env_setup`` only warns (e.g. calibrating rampdown from
+    a flattop policy); its observation/action interface must still match.
+    """
+    algo = _build_algo(cfg, env)
+    rollout_env = getattr(algo.env, "envelope_env", algo.env)
+    num_steps = algo.env_params.max_steps_in_episode
+
+    @jax.jit
+    def ordinary_scores(traj):
+        ordinary = traj.valid & (traj.info.termination_code == -1)
+        return _raw_scores(traj, score_fn), ordinary
+
+    paths = cfg.calib.policy
+    pooled, run_names = [], []
+    for path, rng in zip(paths, seed_keys(cfg.seed, len(paths)), strict=True):
+        policy = load_policy(path)
+        run_name = str(policy.metadata.get("run_name", path))
+        print(f"Calibrating from {path} ({run_name})", flush=True)
+        trained_on = policy.metadata.get("config", {}).get("env", {}).get("env_setup")
+        if trained_on != cfg.env.env_setup:
+            print(
+                f"warning: {path} was trained on {trained_on!r}, not "
+                f"{cfg.env.env_setup!r}; calibrating from it anyway",
+                flush=True,
+            )
+        check_interfaces(policy, env)
+        # make_act closes over the weights, so this compiles once per policy.
+        traj = collect_episodes(
+            policy.make_act(deterministic=False),
+            rollout_env,
+            to_typed_key(rng),
+            num_steps=num_steps,
+            n_seeds=cfg.calib.n_envs,
+            lean=True,
+        )
+        scores, ordinary = ordinary_scores(traj)
+        pooled.append(np.asarray(scores)[np.asarray(ordinary)])
+        run_names.append(run_name)
+    return np.concatenate(pooled), run_names
+
+
+def _calibrate(cfg: AutoScaleConfig, env, score_fn) -> tuple[float, dict]:
+    """``(s, summary)`` from rollouts of every seed's untrained policy, or of
+    the saved policies in ``cfg.calib.policy``.
+
+    Uses the scores of ordinary (non-terminal) steps, pooled over seeds (or
+    policies): the vmapped seeds share one env, so they share one ``s``.
+    """
+    if cfg.calib.policy:
+        scores, run_names = _saved_policy_scores(cfg, env, score_fn)
+        source = {
+            "calib/source": "saved_policy",
+            "calib/policy_run_names": ",".join(run_names),
+        }
+    else:
+        scores = _initial_policy_scores(cfg, env, score_fn)
+        source = {"calib/source": "initial_policy"}
     if scores.size == 0:
         raise RuntimeError("calibration rollouts produced no non-terminal steps")
     quantile = float(np.quantile(np.abs(scores), cfg.calib.coverage))
@@ -183,6 +253,7 @@ def _calibrate(cfg: AutoScaleConfig, env, score_fn) -> tuple[float, dict]:
         "calib/score_p05": float(p05),
         "calib/score_p50": float(p50),
         "calib/score_p95": float(p95),
+        **source,
     }
     return scale, summary
 
@@ -505,6 +576,11 @@ def main(cfg: AutoScaleConfig) -> None:
         )
 
     if cfg.env.reward_score_scale is not None:
+        if cfg.calib.policy:
+            raise ValueError(
+                "--calib.policy calibrates the scale, but --env.reward-score-scale "
+                "skips calibration; pass only one"
+            )
         _run(cfg, cfg.run_name or _run_name(cfg), {})
         return
 
