@@ -11,8 +11,6 @@ Training otherwise matches ``train_ppo.py``'s vmapped path (used for
 ``--num-seeds 1`` too, so there are no single-seed Plotly figures), with extra
 eval-rollout metrics: the raw score return (comparable across ``s``), applied
 actuators, critic accuracy, and whether the scaled scores are still O(1).
-
-    uv run python training/auto_scale_ppo.py --env.env-setup iter/hybrid/rampdown
 """
 
 from __future__ import annotations
@@ -418,6 +416,17 @@ def _run(cfg: AutoScaleConfig, run_name: str, calib_summary: dict) -> None:
         deterministic=cfg.env.deterministic_eval,
     )
 
+    # rejax evaluates once before training, but from outside its lax.scan -
+    # with no data dependency on the scan, XLA is free to schedule that
+    # callback after later ones, so W&B drops it as an out-of-order step. Run
+    # it explicitly first instead, and tell rejax to skip its own.
+    algo = algo.replace(skip_initial_evaluation=True)
+
+    def pre_eval(rng, run_idx):
+        algo_i = algo.with_eval_callback(for_run(run_idx))
+        ts0 = algo_i.init_state(rng)
+        return algo_i.eval_callback(algo_i, ts0, ts0.rng)
+
     def train_one(rng, run_idx):
         # Rebuild the callback inside the trace so each vmapped seed's run_idx
         # tracer flows through to logger.log via jax.debug.callback.
@@ -436,6 +445,7 @@ def _run(cfg: AutoScaleConfig, run_name: str, calib_summary: dict) -> None:
     logger.start_time = time.time()
 
     def _train():
+        jax.block_until_ready(jax.jit(jax.vmap(pre_eval))(seeds, run_idxs))
         ts, results = train_fn(seeds, run_idxs)
         jax.block_until_ready((ts, results))
         jax.effects_barrier()
